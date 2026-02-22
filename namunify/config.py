@@ -96,7 +96,7 @@ Given the following JavaScript code context and a list of symbols to rename, pro
 Rules:
 1. Analyze the context carefully to understand what each variable represents
 2. Use descriptive, camelCase names that reflect the variable's purpose
-3. If multiple variables have the same name in different scopes, use line numbers to distinguish: "varName:lineNumber": "newName"
+3. If multiple symbols have the same name, use "varName:lineNumber" format as key to distinguish them
 4. Consider the variable's usage patterns, assigned values, and how it's used
 5. Output MUST be a valid JSON object wrapped in a markdown code block
 
@@ -105,7 +105,7 @@ Context (with line numbers):
 {context}
 ```
 
-Symbols to rename:
+Symbols to rename (with line numbers):
 {symbols}
 
 Example output format:
@@ -113,9 +113,11 @@ Example output format:
 {{
   "a": "userCount",
   "b": "processData",
-  "c:45": "tempValue"
+  "a:45": "tempValue"
 }}
 ```
+
+Note: In the example above, "a" and "a:45" are two different variables with the same name at different lines.
 
 Now provide the renaming mapping:""",
 
@@ -135,7 +137,7 @@ Snippet where it appears:
 Provide a single meaningful name for this variable. Output format:
 ```json
 {{
-  "{symbol}": "meaningfulName"
+  "symbolName": "meaningfulName"
 }}
 ```""",
 }

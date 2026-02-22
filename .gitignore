@@ -215,3 +215,5 @@ package-lock.json
 *.deobfuscated.js
 output/
 unpacked/
+.namunify_state/
+namunify_debug_*.log

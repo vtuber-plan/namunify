@@ -81,6 +81,7 @@ class BaseLLMClient(ABC):
         context: str,
         symbols: list[str],
         snippets: Optional[dict[str, str]] = None,
+        symbol_lines: Optional[dict[str, int]] = None,
     ) -> dict[str, str]:
         """Rename obfuscated symbols using the LLM.
 
@@ -88,22 +89,32 @@ class BaseLLMClient(ABC):
             context: Full code context with line numbers
             symbols: List of symbols to rename
             snippets: Optional dict mapping symbols to their usage snippets
+            symbol_lines: Optional dict mapping symbols to their line numbers
 
         Returns:
-            Dict mapping old names to new names
+            Dict mapping old names (or "name:line" format) to new names
         """
         from namunify.config import PROMPTS
 
         if len(symbols) == 1:
             symbol = symbols[0]
             snippet = snippets.get(symbol, "") if snippets else ""
+            line_info = f" (defined at line {symbol_lines.get(symbol)})" if symbol_lines and symbol in symbol_lines else ""
             prompt = PROMPTS["rename_single_symbol"].format(
                 context=context,
-                symbol=symbol,
+                symbol=symbol + line_info,
                 snippet=snippet,
             )
         else:
-            symbols_str = "\n".join(f"- {s}" for s in symbols)
+            # Build symbols list with line numbers
+            symbols_list = []
+            for s in symbols:
+                if symbol_lines and s in symbol_lines:
+                    symbols_list.append(f"- {s} (line {symbol_lines[s]})")
+                else:
+                    symbols_list.append(f"- {s}")
+            symbols_str = "\n".join(symbols_list)
+
             prompt = PROMPTS["rename_symbols"].format(
                 context=context,
                 symbols=symbols_str,

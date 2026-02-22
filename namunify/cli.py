@@ -20,12 +20,16 @@ from namunify.core.generator import CodeGenerator
 from namunify.core.webcrack import beautify_js_file
 from namunify.llm import AnthropicClient, OpenAIClient
 from namunify.plugins import BeautifyPlugin, PluginChain
+from namunify.state import StateManager, ProcessingState, ask_resume
 
 console = Console()
 
 # Debug logger
 debug_logger = None
 debug_log_file = None
+
+# State manager (global for process_file access)
+state_manager = StateManager()
 
 
 def setup_debug_logger(log_path: Optional[Path] = None) -> logging.Logger:
@@ -101,6 +105,7 @@ async def process_file(
     file_path: Path,
     config: Config,
     output_path: Optional[Path] = None,
+    resume: bool = True,
 ) -> dict:
     """Process a single JavaScript file.
 
@@ -108,6 +113,7 @@ async def process_file(
         file_path: Path to JavaScript file
         config: Configuration
         output_path: Optional output path
+        resume: Whether to resume from checkpoint if available
 
     Returns:
         Processing statistics
@@ -123,6 +129,8 @@ async def process_file(
     }
 
     llm_client = None
+    processing_state: Optional[ProcessingState] = None
+    start_scope_idx = 0
 
     try:
         # Beautify code first (helps with parsing and LLM context)
@@ -176,6 +184,41 @@ async def process_file(
             console.print("[yellow]No obfuscated symbols found[/yellow]")
             return stats
 
+        # Check for existing checkpoint state
+        if resume and state_manager.has_state(file_path):
+            processing_state = state_manager.load_state(file_path)
+            if processing_state and ask_resume(processing_state, state_manager):
+                start_scope_idx = processing_state.processed_scopes
+                # Apply already processed renames
+                generator.apply_renames(processing_state.all_renames)
+                stats["symbols_renamed"] = len(processing_state.all_renames)
+                console.print(f"[green]Resuming from scope {start_scope_idx + 1}/{len(scope_infos)}[/green]")
+                debug_log("info", f"Resuming from checkpoint", {
+                    "start_scope_idx": start_scope_idx,
+                    "already_renamed": len(processing_state.all_renames),
+                })
+            else:
+                # User chose not to resume, start fresh
+                state_manager.clear_state(file_path)
+                processing_state = None
+
+        # Create or get processing state
+        if processing_state is None:
+            config_dict = {
+                "llm_provider": str(config.llm_provider),
+                "llm_model": config.llm_model,
+                "llm_base_url": config.llm_base_url,
+                "max_symbols_per_batch": config.max_symbols_per_batch,
+                "context_padding": config.context_padding,
+            }
+            processing_state = state_manager.create_state(
+                input_file=file_path,
+                output_file=output_path or file_path.with_suffix(".deobfuscated.js"),
+                total_scopes=len(scope_infos),
+                config=config_dict,
+            )
+            console.print(f"[dim]Checkpoint state saved to .namunify_state/[/dim]")
+
         # Create LLM client
         llm_client = create_llm_client(config)
         debug_log("info", f"Created LLM client", {
@@ -186,19 +229,27 @@ async def process_file(
             "temperature": config.llm_temperature,
         })
 
-        all_renames = {}
+        all_renames = dict(processing_state.all_renames) if processing_state.all_renames else {}
 
-        # Process each scope
+        # Process each scope (starting from checkpoint if resuming)
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Renaming symbols...", total=len(scope_infos))
+            task = progress.add_task(
+                f"Renaming symbols ({start_scope_idx}/{len(scope_infos)})...",
+                total=len(scope_infos)
+            )
+            # Update progress to show current position
+            if start_scope_idx > 0:
+                progress.update(task, completed=start_scope_idx)
 
-            for idx, scope_info in enumerate(scope_infos):
+            for idx in range(start_scope_idx, len(scope_infos)):
+                scope_info = scope_infos[idx]
                 symbols = [id.name for id in scope_info.identifiers]
+                symbol_lines = {id.name: id.line + 1 for id in scope_info.identifiers}  # 1-indexed
                 context = scope_info.identifiers[0].context_before if scope_info.identifiers else ""
 
                 # Build snippets dict
@@ -209,6 +260,7 @@ async def process_file(
                     "scope_type": scope_info.scope_type,
                     "range": f"lines {scope_info.range.start.row}-{scope_info.range.end.row}",
                     "symbols_to_rename": symbols,
+                    "symbol_lines": symbol_lines,
                     "context_length": len(context),
                     "context_preview": context[:500] + "..." if len(context) > 500 else context,
                 })
@@ -219,6 +271,7 @@ async def process_file(
                         context=context,
                         symbols=symbols,
                         snippets=snippets,
+                        symbol_lines=symbol_lines,
                     )
 
                     debug_log("info", f"LLM response for scope {scope_info.scope_id}", {
@@ -232,7 +285,14 @@ async def process_file(
                     stats["symbols_renamed"] += len(renames)
                     all_renames.update(renames)
 
-                    debug_log("info", f"Applied {len(renames)} renames", {
+                    # Save checkpoint state after each scope
+                    state_manager.update_progress(
+                        scope_id=scope_info.scope_id,
+                        scope_index=idx,
+                        renames=renames,
+                    )
+
+                    debug_log("info", f"Applied {len(renames)} renames, checkpoint saved", {
                         "total_renamed_in_scope": len(renames),
                         "total_renamed_so_far": stats["symbols_renamed"],
                     })
@@ -251,9 +311,19 @@ async def process_file(
                         },
                     })
                     console.print(f"[red]Error in scope {scope_info.scope_id}: {e}[/red]")
+                    # Save error state for potential resume
+                    state_manager.mark_error(str(e))
                     # Continue with next scope
 
-                progress.update(task, advance=1, description=f"Processed scope {idx+1}/{len(scope_infos)}")
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"Renaming symbols ({idx+1}/{len(scope_infos)})..."
+                )
+
+        # Mark as completed
+        state_manager.mark_completed()
+        debug_log("info", f"Processing marked as completed")
 
         # Log all renames summary
         debug_log("info", f"\n{'='*80}")
@@ -299,6 +369,7 @@ async def process_directory(
     dir_path: Path,
     config: Config,
     output_dir: Optional[Path] = None,
+    resume: bool = True,
 ) -> list[dict]:
     """Process all JavaScript files in a directory.
 
@@ -306,6 +377,7 @@ async def process_directory(
         dir_path: Path to directory
         config: Configuration
         output_dir: Optional output directory
+        resume: Whether to resume from checkpoint if available
 
     Returns:
         List of processing statistics for each file
@@ -330,7 +402,7 @@ async def process_directory(
         out_path = output_dir / rel_path if output_dir else None
 
         try:
-            result = await process_file(js_file, config, out_path)
+            result = await process_file(js_file, config, out_path, resume=resume)
             results.append(result)
         except Exception as e:
             console.print(f"[red]Error processing {js_file}: {e}[/red]")
@@ -360,6 +432,7 @@ def main():
 @click.option("--install-webcrack", is_flag=True, help="Install webcrack if needed")
 @click.option("--debug", is_flag=True, help="Enable debug logging to file")
 @click.option("--debug-file", type=click.Path(path_type=Path), help="Debug log file path (default: namunify_debug_TIMESTAMP.log)")
+@click.option("--no-resume", is_flag=True, help="Disable checkpoint resume, start fresh")
 def deobfuscate(
     input_path: Path,
     output_path: Optional[Path],
@@ -374,10 +447,15 @@ def deobfuscate(
     install_webcrack: bool,
     debug: bool,
     debug_file: Optional[Path],
+    no_resume: bool,
 ):
     """Deobfuscate JavaScript code using LLM.
 
     INPUT_PATH can be a JavaScript file or directory containing JS files.
+
+    Checkpoint/resume: Processing state is automatically saved to .namunify_state/
+    directory. If interrupted, run the same command again to resume from checkpoint.
+    Use --no-resume to start fresh and ignore existing checkpoints.
     """
     # Setup debug logger if requested
     if debug:
@@ -429,6 +507,7 @@ def deobfuscate(
 
     async def run():
         results = []
+        resume_enabled = not no_resume
 
         # Handle webpack unpacking
         current_input = input_path
@@ -439,10 +518,10 @@ def deobfuscate(
                 debug_log("info", f"Unpacked webpack to: {unpacked_dir}")
 
         if current_input.is_file():
-            result = await process_file(current_input, config, output_path)
+            result = await process_file(current_input, config, output_path, resume=resume_enabled)
             results.append(result)
         else:
-            results = await process_directory(current_input, config, output_path)
+            results = await process_directory(current_input, config, output_path, resume=resume_enabled)
 
         # Print summary
         table = Table(title="Processing Summary")
