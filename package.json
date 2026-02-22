@@ -1,0 +1,13 @@
+{
+  "name": "namunify",
+  "version": "1.0.0",
+  "description": "JavaScript deobfuscation tool using LLM",
+  "type": "module",
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "@babel/traverse": "^7.24.0",
+    "js-beautify": "^1.15.0",
+    "webcrack": "^2.0.0",
+    "prettier": "^3.0.0"
+  }
+}
