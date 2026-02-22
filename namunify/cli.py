@@ -10,8 +10,8 @@ from typing import Optional
 
 import click
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
+from tqdm import tqdm
 
 from namunify import __version__
 from namunify.config import Config, LLMProvider
@@ -192,7 +192,7 @@ async def process_file(
                 # Apply already processed renames
                 generator.apply_renames(processing_state.all_renames)
                 stats["symbols_renamed"] = len(processing_state.all_renames)
-                console.print(f"[green]Resuming from scope {start_scope_idx + 1}/{len(scope_infos)}[/green]")
+                console.print(f"[green]Resuming from scope {start_scope_idx + 1}[/green]")
                 debug_log("info", f"Resuming from checkpoint", {
                     "start_scope_idx": start_scope_idx,
                     "already_renamed": len(processing_state.all_renames),
@@ -231,38 +231,76 @@ async def process_file(
 
         all_renames = dict(processing_state.all_renames) if processing_state.all_renames else {}
 
-        # Process each scope (starting from checkpoint if resuming)
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                f"Renaming symbols ({start_scope_idx}/{len(scope_infos)})...",
-                total=len(scope_infos)
-            )
-            # Update progress to show current position
-            if start_scope_idx > 0:
-                progress.update(task, completed=start_scope_idx)
+        # Track remaining symbols to rename (excluding already renamed)
+        remaining_symbol_names = set()
+        for scope_info in scope_infos[start_scope_idx:]:
+            for id_info in scope_info.identifiers:
+                if id_info.name not in all_renames:
+                    remaining_symbol_names.add(id_info.name)
 
-            for idx in range(start_scope_idx, len(scope_infos)):
-                scope_info = scope_infos[idx]
-                symbols = [id.name for id in scope_info.identifiers]
-                symbol_lines = {id.name: id.line + 1 for id in scope_info.identifiers}  # 1-indexed
-                context = scope_info.identifiers[0].context_before if scope_info.identifiers else ""
+        # Process scopes iteratively, re-parsing after each rename
+        pbar = tqdm(
+            total=total_symbols,
+            initial=len(all_renames),
+            desc="Renaming symbols",
+            unit="symbol",
+            ncols=100,
+        )
+
+        while remaining_symbol_names:
+            # Re-parse current source to get updated AST and positions
+            current_source = generator.get_current_source()
+            current_parse_result = parse_javascript(current_source)
+            current_scope_infos = analyze_identifiers(
+                current_parse_result,
+                max_context_lines=config.context_padding,
+                max_symbols_per_scope=config.max_symbols_per_batch,
+            )
+
+            # Find the first scope with remaining symbols to rename
+            found_scope = False
+            for scope_info in current_scope_infos:
+                scope_symbols = [id.name for id in scope_info.identifiers if id.name in remaining_symbol_names]
+                if not scope_symbols:
+                    continue
+
+                found_scope = True
+                symbols = scope_symbols
+                symbol_lines = {id.name: id.line + 1 for id in scope_info.identifiers if id.name in remaining_symbol_names}
+
+                # Build context from current source
+                current_lines = current_source.split("\n")
+                context_start = max(0, scope_info.range.start.row - 10)
+                context_end = min(len(current_lines), scope_info.range.end.row + 10)
+                context_lines = []
+                for i in range(context_start, context_end):
+                    context_lines.append(f"{i + 1:6d} | {current_lines[i]}")
+                context = "\n".join(context_lines)
 
                 # Build snippets dict
-                snippets = {id.name: id.snippet for id in scope_info.identifiers}
+                snippets = {}
+                for id_info in scope_info.identifiers:
+                    if id_info.name not in remaining_symbol_names:
+                        continue
+                    id_line = id_info.line
+                    snippet_start = max(0, id_line - 3)
+                    snippet_end = min(len(current_lines), id_line + 4)
+                    snippet_lines = []
+                    for i in range(snippet_start, snippet_end):
+                        marker = " >>> " if i == id_line else "     "
+                        snippet_lines.append(f"{marker}{i + 1:6d} | {current_lines[i]}")
+                    snippets[id_info.name] = "\n".join(snippet_lines)
 
                 debug_log("info", f"\n{'='*60}")
-                debug_log("info", f"Processing scope {idx+1}/{len(scope_infos)}: {scope_info.scope_id}", {
+                debug_log("info", f"Processing scope: {scope_info.scope_id}", {
                     "scope_type": scope_info.scope_type,
                     "range": f"lines {scope_info.range.start.row}-{scope_info.range.end.row}",
                     "symbols_to_rename": symbols,
                     "symbol_lines": symbol_lines,
                     "context_length": len(context),
                     "context_preview": context[:500] + "..." if len(context) > 500 else context,
+                    "already_renamed": list(all_renames.keys()),
+                    "remaining": list(remaining_symbol_names),
                 })
 
                 try:
@@ -274,7 +312,7 @@ async def process_file(
                         symbol_lines=symbol_lines,
                     )
 
-                    debug_log("info", f"LLM response for scope {scope_info.scope_id}", {
+                    debug_log("info", f"LLM response", {
                         "renames": renames,
                         "symbols_requested": symbols,
                         "symbols_returned": list(renames.keys()),
@@ -285,41 +323,49 @@ async def process_file(
                     stats["symbols_renamed"] += len(renames)
                     all_renames.update(renames)
 
-                    # Save checkpoint state after each scope
-                    state_manager.update_progress(
-                        scope_id=scope_info.scope_id,
-                        scope_index=idx,
-                        renames=renames,
-                    )
+                    # Remove renamed symbols from remaining
+                    for renamed_symbol in renames.keys():
+                        # Handle both "name" and "name:line" format
+                        base_name = renamed_symbol.split(":")[0]
+                        remaining_symbol_names.discard(base_name)
+                        remaining_symbol_names.discard(renamed_symbol)
+
+                    # Save checkpoint state
+                    state_manager._current_state.all_renames = all_renames.copy()
+                    state_manager._current_state.processed_scopes = len(scope_infos) - len(remaining_symbol_names)
+                    state_manager.save_state(state_manager._current_state)
 
                     debug_log("info", f"Applied {len(renames)} renames, checkpoint saved", {
-                        "total_renamed_in_scope": len(renames),
-                        "total_renamed_so_far": stats["symbols_renamed"],
+                        "total_renamed": stats["symbols_renamed"],
+                        "remaining": list(remaining_symbol_names),
                     })
+
+                    # Update progress bar
+                    pbar.update(len(renames))
+                    pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
 
                 except Exception as e:
                     import traceback
                     error_trace = traceback.format_exc()
-                    debug_log("error", f"Error processing scope {scope_info.scope_id}", {
+                    debug_log("error", f"Error processing scope", {
                         "error_type": type(e).__name__,
                         "error_message": str(e),
                         "traceback": error_trace,
-                        "scope_info": {
-                            "scope_id": scope_info.scope_id,
-                            "scope_type": scope_info.scope_type,
-                            "symbols": symbols,
-                        },
+                        "symbols": symbols,
                     })
-                    console.print(f"[red]Error in scope {scope_info.scope_id}: {e}[/red]")
-                    # Save error state for potential resume
-                    state_manager.mark_error(str(e))
-                    # Continue with next scope
+                    console.print(f"[red]Error: {e}[/red]")
+                    # Skip these symbols and continue
+                    for s in symbols:
+                        remaining_symbol_names.discard(s)
 
-                progress.update(
-                    task,
-                    advance=1,
-                    description=f"Renaming symbols ({idx+1}/{len(scope_infos)})..."
-                )
+                break  # Exit scope loop after processing first scope with remaining symbols
+
+            if not found_scope:
+                # No more scopes with remaining symbols
+                break
+
+        # Close progress bar
+        pbar.close()
 
         # Mark as completed
         state_manager.mark_completed()

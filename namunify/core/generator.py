@@ -1,8 +1,9 @@
-"""Code generation and output formatting."""
+"""Code generation using Babel AST."""
 
-import re
+import json
 import subprocess
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -10,53 +11,86 @@ from rich.console import Console
 
 console = Console()
 
+# Path to scripts directory
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+_SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
+
+
+def check_node_available() -> bool:
+    """Check if Node.js is available on the system."""
+    return shutil.which("node") is not None
+
 
 def generate_code(
     source_code: str,
     renames: dict[str, str],
     line_specific_renames: Optional[dict[str, str]] = None,
 ) -> str:
-    """Generate renamed code by applying symbol renames.
+    """Generate renamed code using Babel AST.
 
     Args:
         source_code: Original source code
         renames: Dict mapping old names to new names
         line_specific_renames: Dict mapping "name:line" to new names
-            for disambiguating same names on different lines
 
     Returns:
         Renamed source code
     """
-    lines = source_code.split("\n")
-    line_specific_renames = line_specific_renames or {}
+    if not renames and not line_specific_renames:
+        return source_code
 
-    # First, apply line-specific renames
-    for key, new_name in line_specific_renames.items():
-        if ":" in key:
-            old_name, line_str = key.rsplit(":", 1)
-            try:
-                line_num = int(line_str) - 1  # Convert to 0-indexed
-                if 0 <= line_num < len(lines):
-                    lines[line_num] = _rename_in_line(lines[line_num], old_name, new_name)
-            except ValueError:
-                continue
+    if not check_node_available():
+        console.print("[yellow]Node.js not available, returning original code[/yellow]")
+        return source_code
 
-    # Join lines back
-    result = "\n".join(lines)
+    # Merge all renames
+    all_renames = dict(renames) if renames else {}
+    if line_specific_renames:
+        all_renames.update(line_specific_renames)
 
-    # Then apply general renames (only for symbols not already renamed)
-    for old_name, new_name in renames.items():
-        # Use word boundary matching to avoid partial replacements
-        pattern = r'\b' + re.escape(old_name) + r'\b'
-        result = re.sub(pattern, new_name, result)
+    if not all_renames:
+        return source_code
 
-    return result
+    # Write source to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+        f.write(source_code)
+        input_file = Path(f.name)
 
+    # Write renames to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(all_renames, f)
+        renames_file = Path(f.name)
 
-def _rename_in_line(line: str, old_name: str, new_name: str) -> str:
-    """Rename a symbol in a single line with word boundary matching."""
-    pattern = r'\b' + re.escape(old_name) + r'\b'
-    return re.sub(pattern, new_name, line)
+    # Write output to temp file
+    output_file = input_file.with_suffix('.generated.js')
+
+    try:
+        generate_script = _SCRIPTS_DIR / "generate.mjs"
+        result = subprocess.run(
+            ["node", str(generate_script), str(input_file), str(renames_file), str(output_file)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        if result.returncode == 0 and output_file.exists():
+            generated_code = output_file.read_text(encoding="utf-8")
+            return generated_code
+        else:
+            console.print(f"[yellow]Babel generation warning: {result.stderr}[/yellow]")
+            return source_code
+
+    except subprocess.TimeoutExpired:
+        console.print("[yellow]Babel generation timed out[/yellow]")
+        return source_code
+    except Exception as e:
+        console.print(f"[yellow]Babel generation error: {e}[/yellow]")
+        return source_code
+    finally:
+        # Cleanup temp files
+        input_file.unlink(missing_ok=True)
+        renames_file.unlink(missing_ok=True)
+        output_file.unlink(missing_ok=True)
 
 
 async def format_with_prettier(code: str, file_path: Optional[Path] = None) -> str:
@@ -64,7 +98,7 @@ async def format_with_prettier(code: str, file_path: Optional[Path] = None) -> s
 
     Args:
         code: Source code to format
-        file_path: Optional file path for context (determines parser)
+        file_path: Optional file path for context
 
     Returns:
         Formatted code
@@ -74,7 +108,6 @@ async def format_with_prettier(code: str, file_path: Optional[Path] = None) -> s
         return code
 
     try:
-        # Use stdin for formatting
         result = subprocess.run(
             ["npx", "prettier", "--parser", "babel"],
             input=code,
@@ -117,7 +150,7 @@ def save_output(
 
 
 class CodeGenerator:
-    """Code generator for handling incremental renames."""
+    """Code generator for handling incremental renames using Babel AST."""
 
     def __init__(self, source_code: str):
         self.original_source = source_code
@@ -130,7 +163,7 @@ class CodeGenerator:
         renames: dict[str, str],
         line_specific: Optional[dict[str, str]] = None,
     ) -> str:
-        """Apply renames and return updated code.
+        """Apply renames using Babel AST and return updated code.
 
         Args:
             renames: Dict mapping old names to new names
@@ -143,6 +176,8 @@ class CodeGenerator:
         if line_specific:
             self.line_specific_renames.update(line_specific)
 
+        # Generate code from original source with all renames applied
+        # This ensures AST positions are correct
         self.current_source = generate_code(
             self.original_source,
             self.applied_renames,
