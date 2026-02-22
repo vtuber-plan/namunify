@@ -41,11 +41,12 @@ const beautified = js(original, {
   jslint_happy: false,
   keep_array_indentation: false,
   keep_function_indentation: false,
-  break_chained_methods: false,
+  break_chained_methods: true,
   brace_style: 'collapse',
   space_before_conditional: true,
   unescape_strings: false,
-  wrap_line_length: 0,
+  wrap_line_length: 120,  // Limit line length
+  wrap_attributes: 'force-expand-multiline',
   e4x: false,
 });
 

@@ -38,8 +38,9 @@ class Config(BaseSettings):
 
     # Processing Settings
     max_context_size: int = Field(default=32000, description="Maximum context size for LLM (in characters)")
+    max_context_lines: int = Field(default=200, description="Maximum lines of context to send to LLM")
     max_symbols_per_batch: int = Field(default=50, description="Maximum symbols to rename in one batch")
-    context_padding: int = Field(default=500, description="Lines of context around symbol")
+    context_padding: int = Field(default=200, description="Lines of context around symbol (legacy, use max_context_lines)")
 
     # Output Settings
     output_dir: Optional[Path] = Field(default=None, description="Output directory for deobfuscated files")

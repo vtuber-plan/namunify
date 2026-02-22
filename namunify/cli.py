@@ -269,13 +269,41 @@ async def process_file(
                 symbol_lines = {id.name: id.line + 1 for id in scope_info.identifiers if id.name in remaining_symbol_names}
 
                 # Build context from current source
+                # Limit context size to avoid sending huge context to LLM
+                MAX_CONTEXT_LINES = config.max_context_lines  # Max lines to send
+
                 current_lines = current_source.split("\n")
-                context_start = max(0, scope_info.range.start.row - 10)
-                context_end = min(len(current_lines), scope_info.range.end.row + 10)
-                context_lines = []
-                for i in range(context_start, context_end):
-                    context_lines.append(f"{i + 1:6d} | {current_lines[i]}")
-                context = "\n".join(context_lines)
+                scope_line_count = scope_info.range.end.row - scope_info.range.start.row + 1
+
+                if scope_line_count <= MAX_CONTEXT_LINES:
+                    # Small scope: include entire scope with padding
+                    context_start = max(0, scope_info.range.start.row - 10)
+                    context_end = min(len(current_lines), scope_info.range.end.row + 10)
+                    context_lines = []
+                    for i in range(context_start, context_end):
+                        context_lines.append(f"{i + 1:6d} | {current_lines[i]}")
+                    context = "\n".join(context_lines)
+                else:
+                    # Large scope: only include context around each symbol
+                    context_line_set = set()
+                    for id_info in scope_info.identifiers:
+                        if id_info.name not in remaining_symbol_names:
+                            continue
+                        id_line = id_info.line
+                        # Add lines around each symbol
+                        for i in range(max(0, id_line - 20), min(len(current_lines), id_line + 20)):
+                            context_line_set.add(i)
+
+                    # If still too many lines, limit further
+                    if len(context_line_set) > MAX_CONTEXT_LINES:
+                        # Prioritize lines closest to symbols
+                        sorted_lines = sorted(context_line_set)
+                        context_line_set = set(sorted_lines[:MAX_CONTEXT_LINES])
+
+                    context_lines = []
+                    for i in sorted(context_line_set):
+                        context_lines.append(f"{i + 1:6d} | {current_lines[i]}")
+                    context = "\n".join(context_lines)
 
                 # Build snippets dict
                 snippets = {}
