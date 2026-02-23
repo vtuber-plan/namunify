@@ -131,6 +131,7 @@ def _build_global_symbol_context(
     symbol: str,
     declaration_line: int,
     max_context_lines: int,
+    reference_lines: Optional[list[int]] = None,
     declaration_window: int = 12,
     reference_window: int = 2,
     max_reference_points: int = 10,
@@ -141,8 +142,11 @@ def _build_global_symbol_context(
         return ""
 
     decl_line = min(max(0, declaration_line), total_lines - 1)
-    all_occurrences = _find_identifier_occurrence_lines(lines, symbol)
-    reference_lines = [line for line in all_occurrences if line != decl_line][:max_reference_points]
+    if reference_lines is None:
+        all_occurrences = _find_identifier_occurrence_lines(lines, symbol)
+        selected_reference_lines = [line for line in all_occurrences if line != decl_line][:max_reference_points]
+    else:
+        selected_reference_lines = [line for line in reference_lines if line != decl_line][:max_reference_points]
 
     selected_set: set[int] = set()
     selected_ordered: list[int] = []
@@ -157,13 +161,17 @@ def _build_global_symbol_context(
             selected_ordered.append(line_no)
 
     add_lines(_line_window(decl_line, declaration_window, total_lines))
-    for ref_line in reference_lines:
+    for ref_line in selected_reference_lines:
         add_lines(_line_window(ref_line, reference_window, total_lines))
         if len(selected_ordered) >= max_context_lines:
             break
 
     selected_ordered.sort()
-    reference_lines_1_based = ", ".join(str(line + 1) for line in reference_lines) if reference_lines else "none"
+    reference_lines_1_based = (
+        ", ".join(str(line + 1) for line in selected_reference_lines)
+        if selected_reference_lines
+        else "none"
+    )
 
     header = (
         f"Global symbol: {symbol}\n"
@@ -177,6 +185,7 @@ def _build_global_symbol_snippet(
     lines: list[str],
     symbol: str,
     declaration_line: int,
+    reference_lines: Optional[list[int]] = None,
     snippet_radius: int = 3,
     max_reference_snippets: int = 3,
 ) -> str:
@@ -186,8 +195,11 @@ def _build_global_symbol_snippet(
         return ""
 
     decl_line = min(max(0, declaration_line), total_lines - 1)
-    occurrences = _find_identifier_occurrence_lines(lines, symbol)
-    ref_lines = [line for line in occurrences if line != decl_line][:max_reference_snippets]
+    if reference_lines is None:
+        occurrences = _find_identifier_occurrence_lines(lines, symbol)
+        ref_lines = [line for line in occurrences if line != decl_line][:max_reference_snippets]
+    else:
+        ref_lines = [line for line in reference_lines if line != decl_line][:max_reference_snippets]
 
     parts = []
     decl_block_lines = _line_window(decl_line, snippet_radius, total_lines)
@@ -206,6 +218,25 @@ def _build_global_symbol_snippet(
         parts.append(f"Reference {idx} (line {ref_line + 1}):\n" + "\n".join(ref_block))
 
     return "\n\n".join(parts)
+
+
+def _get_binding_reference_lines(
+    parse_result,
+    symbol: str,
+    declaration_line: int,
+) -> Optional[list[int]]:
+    """Get reference lines for a specific binding from AST parse result."""
+    for binding in parse_result.all_bindings:
+        if binding.name != symbol:
+            continue
+        if binding.range.start.row != declaration_line:
+            continue
+
+        if not binding.reference_lines:
+            return None
+        return sorted({line for line in binding.reference_lines if line != declaration_line})
+
+    return None
 
 
 async def process_file(
@@ -251,12 +282,13 @@ async def process_file(
 
         # Ensure variable bindings with the same name in different scopes are unique
         console.print(f"[blue]Uniquifying variable names[/blue] {beautified_file}")
-        uniquified_source = uniquify_binding_names(source_code)
+        uniquified_file = file_path.with_suffix(".uniquified.js")
+        uniquified_source = uniquify_binding_names(source_code, output_path=uniquified_file)
         if uniquified_source != source_code:
-            debug_log("info", "Applied binding-name uniquification")
+            debug_log("info", f"Applied binding-name uniquification: {uniquified_file}")
             source_code = uniquified_source
         else:
-            debug_log("info", "Binding-name uniquification produced no changes")
+            debug_log("info", f"Binding-name uniquification produced no changes: {uniquified_file}")
 
         generator = CodeGenerator(source_code)
 
@@ -390,17 +422,37 @@ async def process_file(
 
                 current_lines = current_source.split("\n")
                 scope_line_count = scope_info.range.end.row - scope_info.range.start.row + 1
+                global_context_meta: dict[str, object] = {}
 
                 if scope_info.scope_type == "program" and len(symbols) == 1:
                     # Global symbol: use focused declaration context + reference snippets.
                     symbol = symbols[0]
                     declaration_line = symbol_lines.get(symbol, 1) - 1
+                    ast_reference_lines = _get_binding_reference_lines(
+                        current_parse_result,
+                        symbol,
+                        declaration_line,
+                    )
                     context = _build_global_symbol_context(
                         current_lines,
                         symbol,
                         declaration_line,
                         max_context_lines=MAX_CONTEXT_LINES,
+                        reference_lines=ast_reference_lines,
                     )
+                    reference_preview_lines = ast_reference_lines or []
+                    global_context_meta = {
+                        "global_declaration_text": (
+                            current_lines[declaration_line]
+                            if 0 <= declaration_line < len(current_lines)
+                            else ""
+                        ),
+                        "global_reference_texts": [
+                            f"{line_no + 1}: {current_lines[line_no]}"
+                            for line_no in reference_preview_lines[:5]
+                            if 0 <= line_no < len(current_lines)
+                        ],
+                    }
                 elif scope_line_count <= MAX_CONTEXT_LINES:
                     # Small scope: include entire scope with padding
                     context_start = max(0, scope_info.range.start.row - 10)
@@ -438,10 +490,16 @@ async def process_file(
                         continue
                     id_line = id_info.line
                     if scope_info.scope_type == "program":
+                        ast_reference_lines = _get_binding_reference_lines(
+                            current_parse_result,
+                            id_info.name,
+                            id_line,
+                        )
                         snippets[id_info.name] = _build_global_symbol_snippet(
                             current_lines,
                             id_info.name,
                             id_line,
+                            reference_lines=ast_reference_lines,
                         )
                     else:
                         snippet_start = max(0, id_line - 3)
@@ -462,6 +520,7 @@ async def process_file(
                     "context_preview": context[:500] + "..." if len(context) > 500 else context,
                     "already_renamed": list(all_renames.keys()),
                     "remaining": list(remaining_symbol_names),
+                    **global_context_meta,
                 })
 
                 try:

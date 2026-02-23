@@ -93,11 +93,15 @@ def generate_code(
         output_file.unlink(missing_ok=True)
 
 
-def uniquify_binding_names(source_code: str) -> str:
+def uniquify_binding_names(
+    source_code: str,
+    output_path: Optional[Path] = None,
+) -> str:
     """Rename duplicated binding names so each binding name is globally unique.
 
     Args:
         source_code: Source code to process
+        output_path: Optional path to save uniquified code
 
     Returns:
         Source code with uniquely named bindings
@@ -114,8 +118,11 @@ def uniquify_binding_names(source_code: str) -> str:
         f.write(source_code)
         input_file = Path(f.name)
 
-    # Write output to temp file
-    output_file = input_file.with_suffix('.uniquified.js')
+    # Write output to temp file unless caller provides output path
+    temp_output_file = input_file.with_suffix('.uniquified.js')
+    output_file = output_path if output_path is not None else temp_output_file
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         uniquify_script = _SCRIPTS_DIR / "uniquify_bindings.mjs"
@@ -127,7 +134,10 @@ def uniquify_binding_names(source_code: str) -> str:
         )
 
         if result.returncode == 0 and output_file.exists():
-            return output_file.read_text(encoding="utf-8")
+            uniquified_code = output_file.read_text(encoding="utf-8")
+            if output_path is not None:
+                console.print(f"[dim]Uniquified: {output_path}[/dim]")
+            return uniquified_code
 
         console.print(f"[yellow]Binding uniquification warning: {result.stderr}[/yellow]")
         return source_code
@@ -140,7 +150,8 @@ def uniquify_binding_names(source_code: str) -> str:
         return source_code
     finally:
         input_file.unlink(missing_ok=True)
-        output_file.unlink(missing_ok=True)
+        if output_path is None:
+            temp_output_file.unlink(missing_ok=True)
 
 
 async def format_with_prettier(code: str, file_path: Optional[Path] = None) -> str:

@@ -183,3 +183,15 @@ function second(a) {
         assert "run" in binding_names
         assert "alpha" in binding_names
         assert "beta" in binding_names
+
+    def test_write_uniquified_output_file(self, tmp_path):
+        """Uniquified intermediate result should be writable to a target file."""
+        code = "function first(a){return a;} function second(a){return a;}"
+        output_file = tmp_path / "sample.uniquified.js"
+
+        result = uniquify_binding_names(code, output_path=output_file)
+
+        assert output_file.exists()
+        saved = output_file.read_text(encoding="utf-8")
+        assert saved == result
+        assert "__u" in saved

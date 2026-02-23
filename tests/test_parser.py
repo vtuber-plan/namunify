@@ -1,5 +1,7 @@
 """Tests for parser module."""
 
+import shutil
+
 import pytest
 
 from namunify.core.parser import (
@@ -10,6 +12,8 @@ from namunify.core.parser import (
     Scope,
     parse_javascript,
 )
+
+NODE_AVAILABLE = shutil.which("node") is not None
 
 
 class TestPosition:
@@ -115,6 +119,20 @@ var obj = {
         result = parse_javascript(code)
 
         assert "scope_0" in result.scopes
+
+    @pytest.mark.skipif(not NODE_AVAILABLE, reason="Node.js is required for Babel reference extraction")
+    def test_parse_binding_reference_lines(self):
+        """Test parser captures reference lines for bindings when available."""
+        code = "var xi = Object.getOwnPropertyNames;\nfunction run(obj) { return xi(obj); }"
+        result = parse_javascript(code)
+
+        xi_bindings = [
+            b for b in result.all_bindings
+            if b.name == "xi" and b.range.start.row == 0
+        ]
+        assert xi_bindings
+        # When Babel path.scope binding info is available, xi should reference line 2 (0-indexed: 1).
+        assert 1 in xi_bindings[0].reference_lines
 
 
 class TestScope:

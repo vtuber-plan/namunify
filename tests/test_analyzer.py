@@ -51,6 +51,15 @@ class TestIsObfuscatedName:
         assert is_obfuscated_name("b2") is True
         assert is_obfuscated_name("x9") is True
 
+    def test_uniquified_name_uses_base_name_for_detection(self):
+        """Uniquified names should be judged using base name before __u suffix."""
+        assert is_obfuscated_name("a2__u1") is True
+        assert is_obfuscated_name("h__u1") is True
+        assert is_obfuscated_name("processData__u2") is False
+        # Uniquified loop-counter names should no longer be preserved.
+        assert is_obfuscated_name("i__u6") is True
+        assert is_obfuscated_name("j__u2") is True
+
     def test_normal_names_not_obfuscated(self):
         """Normal descriptive names should not be obfuscated."""
         assert is_obfuscated_name("userName") is False
@@ -153,6 +162,26 @@ function f(a, b) {
         assert function_scopes
         assert any(len(scope.identifiers) > 1 for scope in function_scopes)
 
+    def test_block_scope_can_batch_symbols(self):
+        """Block scope can include multiple symbols in one batch."""
+        code = """
+function f(e__u9, t__u8) {
+    for (let i__u6 = 0, s__u4 = 0; i__u6 < 1; i__u6++) {
+        s__u4 += t__u8[i__u6];
+    }
+    return s__u4 >= e__u9;
+}
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+
+        block_scopes = [s for s in scopes if s.scope_type == "block"]
+        assert block_scopes
+        assert any(
+            {"i__u6", "s__u4"}.issubset({identifier.name for identifier in scope.identifiers})
+            for scope in block_scopes
+        )
+
     def test_block_scope_not_merged_into_function(self):
         """Nested block scope identifiers should remain in block scope."""
         code = """
@@ -174,6 +203,24 @@ function f() {
             for s in scopes
             if s.scope_type != "block"
         )
+
+    def test_scopes_are_sorted_from_small_to_large(self):
+        """Batches should be ordered by smaller scope first."""
+        code = """
+var a = 1;
+function f() {
+    var b = 2;
+    if (b) {
+        var c = 3;
+    }
+}
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+
+        assert scopes
+        spans = [s.range.end.row - s.range.start.row + 1 for s in scopes]
+        assert spans == sorted(spans)
 
 
 class TestScopeInfo:

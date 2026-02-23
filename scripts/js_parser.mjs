@@ -465,20 +465,61 @@ traverse.default(ast, {
   },
 });
 
+// Collect binding reference lines using Babel scope bindings.
+// Key format: `${name}:${line}:${column}` where line is 0-indexed.
+const bindingReferenceMap = new Map();
+function bindingKey(name, line, column) {
+  return `${name}:${line}:${column}`;
+}
+
+traverse.default(ast, {
+  Scope(path) {
+    for (const [name, binding] of Object.entries(path.scope.bindings)) {
+      const id = binding?.identifier;
+      if (!id?.loc) continue;
+
+      const line = id.loc.start.line - 1;
+      const column = id.loc.start.column;
+      const key = bindingKey(name, line, column);
+
+      if (!bindingReferenceMap.has(key)) {
+        bindingReferenceMap.set(key, new Set());
+      }
+
+      for (const refPath of binding.referencePaths || []) {
+        const refLoc = refPath.node?.loc?.start;
+        if (!refLoc) continue;
+        bindingReferenceMap.get(key).add(refLoc.line - 1);
+      }
+    }
+  },
+});
+
 // Collect all bindings for result
 for (const scopeId in allScopes) {
   const scope = allScopes[scopeId];
+  const bindingsWithRefs = scope.bindings.map(b => {
+    const key = bindingKey(b.name, b.line, b.column);
+    const referenceLines = bindingReferenceMap.has(key)
+      ? Array.from(bindingReferenceMap.get(key)).sort((a, c) => a - c)
+      : [];
+    return {
+      ...b,
+      referenceLines,
+    };
+  });
+
   result.scopes[scopeId] = {
     scopeId: scope.scopeId,
     type: scope.type,
     range: scope.range,
     parentId: scope.parentId,
     children: scope.children,
-    bindings: scope.bindings,
+    bindings: bindingsWithRefs,
   };
 
   // Add to flat bindings list
-  scope.bindings.forEach(b => {
+  bindingsWithRefs.forEach(b => {
     result.bindings.push({
       ...b,
       scopeId: scopeId,

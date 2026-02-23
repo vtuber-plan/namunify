@@ -55,6 +55,7 @@ class BindingIdentifier:
     binding_type: str = "variable"  # variable, parameter, function, class
     is_declaration: bool = False
     is_obfuscated: bool = False
+    reference_lines: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -203,6 +204,7 @@ def _convert_babel_result(source_code: str, data: dict) -> ParseResult:
                 binding_type=binding_data.get("type", "variable"),
                 is_declaration=True,
                 is_obfuscated=binding_data.get("isObfuscated", False),
+                reference_lines=binding_data.get("referenceLines", []),
             )
             scope.bindings.append(binding)
             all_bindings.append(binding)

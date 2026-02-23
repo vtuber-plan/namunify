@@ -48,6 +48,16 @@ def is_obfuscated_name(name: str) -> bool:
     if not name:
         return False
 
+    # If name was uniquified (e.g., foo__u12), evaluate obfuscation on the base
+    # so uniquified short names can still be renamed by LLM.
+    was_uniquified = False
+    uniquified_match = re.match(r"^(.+)__u\d+$", name)
+    if uniquified_match:
+        base_name = uniquified_match.group(1)
+        if base_name:
+            name = base_name
+            was_uniquified = True
+
     # Common meaningful short names to preserve
     preserved_names = {
         "i", "j", "k",  # Loop counters (often meaningful)
@@ -57,7 +67,10 @@ def is_obfuscated_name(name: str) -> bool:
         "up", "on", "in", "to",  # Common words
     }
 
-    if name.lower() in preserved_names:
+    # Keep preserving common short names for original source.
+    # For uniquified names (e.g., i__u6), we intentionally do not preserve,
+    # so they can still be renamed in deobfuscation.
+    if not was_uniquified and name.lower() in preserved_names:
         return False
 
     # Single letter (except preserved)
@@ -183,12 +196,16 @@ def analyze_identifiers(
         else:
             result.append(scope_info)
 
+    result.sort(key=_scope_sort_key)
     return result
 
 
 def _can_batch_in_scope(scope_type: str) -> bool:
-    """Whether this scope type can contain multi-symbol batches."""
-    return scope_type in ("function", "method", "arrow", "class")
+    """Whether this scope type can contain multi-symbol batches.
+
+    We only forbid batching at global program scope.
+    """
+    return scope_type != "program"
 
 
 def _prepare_scope_context(
@@ -280,6 +297,22 @@ def _split_scope_to_singletons(scope_info: ScopeInfo) -> list[ScopeInfo]:
         chunks.append(chunk)
 
     return chunks
+
+
+def _scope_sort_key(scope_info: ScopeInfo) -> tuple[int, int, int, str]:
+    """Sort smaller scopes first, then smaller batches first.
+
+    Order:
+    1. Scope span in lines (small -> large)
+    2. Identifier count in batch (small -> large)
+    3. Scope start line (top -> bottom)
+    4. Scope id (stable tie-breaker)
+    """
+    span_lines = max(1, scope_info.range.end.row - scope_info.range.start.row + 1)
+    identifier_count = len(scope_info.identifiers)
+    start_line = scope_info.range.start.row
+    stable_id = scope_info.scope_id
+    return (span_lines, identifier_count, start_line, stable_id)
 
 
 def format_context_with_line_numbers(
