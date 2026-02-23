@@ -619,7 +619,7 @@ async def process_file(
                     "context_length": len(context),
                     "context_preview": context[:500] + "..." if len(context) > 500 else context,
                     "already_renamed": list(all_renames.keys()),
-                    "remaining": list(remaining_symbol_names),
+                    "remaining_count": len(remaining_symbol_names),
                     **global_context_meta,
                 })
 
@@ -714,7 +714,7 @@ async def process_file(
                     debug_log("info", f"Applied {len(filtered_renames)} renames, checkpoint saved", {
                         "total_renamed": stats["symbols_renamed"],
                         "resolved_symbols_count": len(resolved_symbols),
-                        "remaining": list(remaining_symbol_names),
+                        "remaining_count": len(remaining_symbol_names),
                     })
 
                     # Update progress bar
