@@ -112,6 +112,64 @@ def _find_identifier_occurrence_lines(lines: list[str], identifier: str) -> list
     return [idx for idx, line in enumerate(lines) if pattern.search(line)]
 
 
+def _clip_line_content(content: str, max_chars: int = 500) -> str:
+    """Clip very long source lines to keep prompt size bounded."""
+    if max_chars <= 0 or len(content) <= max_chars:
+        return content
+    head = max_chars - 3
+    if head <= 0:
+        return "..."
+    return content[:head] + "..."
+
+
+def _format_numbered_line(line_no: int, content: str, max_line_chars: int = 500) -> str:
+    """Format a source line with line number and clipping."""
+    return f"{line_no + 1:6d} | {_clip_line_content(content, max_line_chars)}"
+
+
+def _truncate_text_middle(text: str, max_chars: int) -> str:
+    """Truncate long text while preserving both head and tail."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    marker = "\n... [truncated] ...\n"
+    keep = max_chars - len(marker)
+    if keep <= 32:
+        return text[:max_chars]
+
+    head_keep = int(keep * 0.7)
+    tail_keep = keep - head_keep
+    return text[:head_keep] + marker + text[-tail_keep:]
+
+
+def _apply_prompt_size_limits(
+    context: str,
+    snippets: dict[str, str],
+    max_context_chars: int,
+    max_snippet_chars: int,
+) -> tuple[str, dict[str, str]]:
+    """Apply size limits to context and snippets before sending to LLM."""
+    limited_context = _truncate_text_middle(context, max_context_chars)
+    limited_snippets = {
+        name: _truncate_text_middle(snippet, max_snippet_chars)
+        for name, snippet in snippets.items()
+    }
+    return limited_context, limited_snippets
+
+
+def _is_input_too_long_error(exc: Exception) -> bool:
+    """Check whether exception indicates request input is too long."""
+    message = str(exc).lower()
+    indicators = (
+        "range of input length",
+        "input length",
+        "context length",
+        "maximum context length",
+        "token limit",
+    )
+    return any(indicator in message for indicator in indicators)
+
+
 def _line_window(center: int, radius: int, total_lines: int) -> list[int]:
     """Get a bounded line window around a center line."""
     if total_lines <= 0:
@@ -123,7 +181,7 @@ def _line_window(center: int, radius: int, total_lines: int) -> list[int]:
 
 def _format_line_block(lines: list[str], line_numbers: list[int]) -> str:
     """Format selected line numbers with 1-based line labels."""
-    return "\n".join(f"{line_no + 1:6d} | {lines[line_no]}" for line_no in line_numbers)
+    return "\n".join(_format_numbered_line(line_no, lines[line_no]) for line_no in line_numbers)
 
 
 def _build_global_symbol_context(
@@ -442,15 +500,15 @@ async def process_file(
                     )
                     reference_preview_lines = ast_reference_lines or []
                     global_context_meta = {
-                        "global_declaration_text": (
-                            current_lines[declaration_line]
-                            if 0 <= declaration_line < len(current_lines)
-                            else ""
-                        ),
+                        "global_declaration_text": _clip_line_content(
+                            current_lines[declaration_line],
+                            300,
+                        ) if 0 <= declaration_line < len(current_lines) else "",
                         "global_reference_texts": [
-                            f"{line_no + 1}: {current_lines[line_no]}"
+                            f"{line_no + 1}: {_clip_line_content(current_lines[line_no], 300)}"
                             for line_no in reference_preview_lines[:5]
-                            if 0 <= line_no < len(current_lines)
+                            if 0 <= declaration_line < len(current_lines)
+                            and 0 <= line_no < len(current_lines)
                         ],
                     }
                 elif scope_line_count <= MAX_CONTEXT_LINES:
@@ -459,7 +517,7 @@ async def process_file(
                     context_end = min(len(current_lines), scope_info.range.end.row + 10)
                     context_lines = []
                     for i in range(context_start, context_end):
-                        context_lines.append(f"{i + 1:6d} | {current_lines[i]}")
+                        context_lines.append(_format_numbered_line(i, current_lines[i]))
                     context = "\n".join(context_lines)
                 else:
                     # Large scope: only include context around each symbol
@@ -480,7 +538,7 @@ async def process_file(
 
                     context_lines = []
                     for i in sorted(context_line_set):
-                        context_lines.append(f"{i + 1:6d} | {current_lines[i]}")
+                        context_lines.append(_format_numbered_line(i, current_lines[i]))
                     context = "\n".join(context_lines)
 
                 # Build snippets dict
@@ -507,8 +565,19 @@ async def process_file(
                         snippet_lines = []
                         for i in range(snippet_start, snippet_end):
                             marker = " >>> " if i == id_line else "     "
-                            snippet_lines.append(f"{marker}{i + 1:6d} | {current_lines[i]}")
+                            snippet_lines.append(f"{marker}{_format_numbered_line(i, current_lines[i])}")
                         snippets[id_info.name] = "\n".join(snippet_lines)
+
+                # Enforce max prompt size to avoid provider input-length errors.
+                # `max_context_size` is char-based budget for context text.
+                max_context_chars = max(2048, config.max_context_size)
+                max_snippet_chars = max(1024, min(12000, max_context_chars // 2))
+                context, snippets = _apply_prompt_size_limits(
+                    context=context,
+                    snippets=snippets,
+                    max_context_chars=max_context_chars,
+                    max_snippet_chars=max_snippet_chars,
+                )
 
                 debug_log("info", f"\n{'='*60}")
                 debug_log("info", f"Processing scope: {scope_info.scope_id}", {
@@ -525,12 +594,34 @@ async def process_file(
 
                 try:
                     # Call LLM to rename
-                    renames = await llm_client.rename_symbols(
-                        context=context,
-                        symbols=symbols,
-                        snippets=snippets,
-                        symbol_lines=symbol_lines,
-                    )
+                    try:
+                        renames = await llm_client.rename_symbols(
+                            context=context,
+                            symbols=symbols,
+                            snippets=snippets,
+                            symbol_lines=symbol_lines,
+                        )
+                    except Exception as e:
+                        if not _is_input_too_long_error(e):
+                            raise
+
+                        debug_log("warning", "LLM input too long, retrying with compact context", {
+                            "error": str(e),
+                            "symbols": symbols,
+                            "context_length": len(context),
+                        })
+                        compact_context, compact_snippets = _apply_prompt_size_limits(
+                            context=context,
+                            snippets=snippets,
+                            max_context_chars=min(8000, max_context_chars),
+                            max_snippet_chars=min(2000, max_snippet_chars),
+                        )
+                        renames = await llm_client.rename_symbols(
+                            context=compact_context,
+                            symbols=symbols,
+                            snippets=compact_snippets,
+                            symbol_lines=symbol_lines,
+                        )
 
                     debug_log("info", f"LLM response", {
                         "renames": renames,
