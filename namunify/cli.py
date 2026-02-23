@@ -339,14 +339,21 @@ async def process_file(
         debug_log("debug", f"Source code length: {len(source_code)} chars")
 
         # Ensure variable bindings with the same name in different scopes are unique
-        console.print(f"[blue]Uniquifying variable names[/blue] {beautified_file}")
-        uniquified_file = file_path.with_suffix(".uniquified.js")
-        uniquified_source = uniquify_binding_names(source_code, output_path=uniquified_file)
-        if uniquified_source != source_code:
-            debug_log("info", f"Applied binding-name uniquification: {uniquified_file}")
-            source_code = uniquified_source
+        if config.enable_uniquify:
+            console.print(f"[blue]Uniquifying variable names[/blue] {beautified_file}")
+            uniquified_file = file_path.with_suffix(".uniquified.js")
+            uniquified_source = uniquify_binding_names(
+                source_code,
+                output_path=uniquified_file,
+                timeout_seconds=config.uniquify_timeout_seconds,
+            )
+            if uniquified_source != source_code:
+                debug_log("info", f"Applied binding-name uniquification: {uniquified_file}")
+                source_code = uniquified_source
+            else:
+                debug_log("info", f"Binding-name uniquification produced no changes: {uniquified_file}")
         else:
-            debug_log("info", f"Binding-name uniquification produced no changes: {uniquified_file}")
+            debug_log("info", "Binding-name uniquification disabled by configuration")
 
         generator = CodeGenerator(source_code)
 
@@ -820,6 +827,8 @@ def main():
 @click.option("--max-symbols", default=50, help="Max symbols per LLM call")
 @click.option("--context-padding", default=500, help="Lines of context around symbols")
 @click.option("--no-prettier", is_flag=True, help="Disable prettier formatting")
+@click.option("--no-uniquify", is_flag=True, help="Disable binding-name uniquification step")
+@click.option("--uniquify-timeout", default=300, help="Uniquification timeout in seconds")
 @click.option("--unpack", is_flag=True, help="Unpack webpack bundle first")
 @click.option("--install-webcrack", is_flag=True, help="Install webcrack if needed")
 @click.option("--debug", is_flag=True, help="Enable debug logging to file")
@@ -835,6 +844,8 @@ def deobfuscate(
     max_symbols: int,
     context_padding: int,
     no_prettier: bool,
+    no_uniquify: bool,
+    uniquify_timeout: int,
     unpack: bool,
     install_webcrack: bool,
     debug: bool,
@@ -861,6 +872,8 @@ def deobfuscate(
             "max_symbols": max_symbols,
             "context_padding": context_padding,
             "prettier_format": not no_prettier,
+            "enable_uniquify": not no_uniquify,
+            "uniquify_timeout_seconds": uniquify_timeout,
         })
 
     # Build config kwargs, only include non-None CLI args to let .env values be used
@@ -869,6 +882,8 @@ def deobfuscate(
         "max_symbols_per_batch": max_symbols,
         "context_padding": context_padding,
         "prettier_format": not no_prettier,
+        "enable_uniquify": not no_uniquify,
+        "uniquify_timeout_seconds": uniquify_timeout,
     }
 
     # Only override .env values if CLI args are explicitly provided
@@ -888,6 +903,8 @@ def deobfuscate(
         "max_symbols_per_batch": config.max_symbols_per_batch,
         "context_padding": config.context_padding,
         "prettier_format": config.prettier_format,
+        "enable_uniquify": config.enable_uniquify,
+        "uniquify_timeout_seconds": config.uniquify_timeout_seconds,
     })
 
     # Validate API key

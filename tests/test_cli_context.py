@@ -1,9 +1,12 @@
 """Tests for CLI context building helpers."""
 
 from namunify.cli import (
+    _apply_prompt_size_limits,
     _build_global_symbol_context,
     _build_global_symbol_snippet,
     _find_identifier_occurrence_lines,
+    _is_input_too_long_error,
+    _truncate_text_middle,
 )
 
 
@@ -56,3 +59,29 @@ class TestGlobalContextHelpers:
 
         assert "Declaration:" in snippet
         assert "Reference 1 (line 3):" in snippet
+
+    def test_truncate_text_middle(self):
+        """Long text should be truncated with marker."""
+        text = "A" * 200 + "B" * 200
+        truncated = _truncate_text_middle(text, 120)
+        assert len(truncated) <= 120
+        assert "[truncated]" in truncated
+
+    def test_apply_prompt_size_limits(self):
+        """Context and snippets should respect size limits."""
+        context = "x" * 1000
+        snippets = {"a": "y" * 800}
+        limited_context, limited_snippets = _apply_prompt_size_limits(
+            context=context,
+            snippets=snippets,
+            max_context_chars=300,
+            max_snippet_chars=200,
+        )
+
+        assert len(limited_context) <= 300
+        assert len(limited_snippets["a"]) <= 200
+
+    def test_detect_input_too_long_error(self):
+        """Length-related error message should be detected."""
+        err = Exception("Range of input length should be [1, 131072]")
+        assert _is_input_too_long_error(err) is True

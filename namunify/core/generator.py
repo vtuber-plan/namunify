@@ -96,12 +96,14 @@ def generate_code(
 def uniquify_binding_names(
     source_code: str,
     output_path: Optional[Path] = None,
+    timeout_seconds: int = 300,
 ) -> str:
     """Rename duplicated binding names so each binding name is globally unique.
 
     Args:
         source_code: Source code to process
         output_path: Optional path to save uniquified code
+        timeout_seconds: Timeout in seconds for Babel uniquification
 
     Returns:
         Source code with uniquely named bindings
@@ -112,6 +114,11 @@ def uniquify_binding_names(
     if not check_node_available():
         console.print("[yellow]Node.js not available, skipping binding uniquification[/yellow]")
         return source_code
+
+    # Use adaptive timeout for large files to reduce false timeouts.
+    # Rough heuristic: 1s per 50k chars, bounded to [120, 1200].
+    adaptive_timeout = min(1200, max(120, len(source_code) // 50000))
+    effective_timeout = max(timeout_seconds, adaptive_timeout)
 
     # Write source to temp file
     with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
@@ -130,7 +137,7 @@ def uniquify_binding_names(
             ["node", str(uniquify_script), str(input_file), str(output_file)],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=effective_timeout,
         )
 
         if result.returncode == 0 and output_file.exists():
@@ -143,7 +150,7 @@ def uniquify_binding_names(
         return source_code
 
     except subprocess.TimeoutExpired:
-        console.print("[yellow]Binding uniquification timed out[/yellow]")
+        console.print(f"[yellow]Binding uniquification timed out ({effective_timeout}s)[/yellow]")
         return source_code
     except Exception as e:
         console.print(f"[yellow]Binding uniquification error: {e}[/yellow]")

@@ -41,6 +41,8 @@ class Config(BaseSettings):
     max_context_lines: int = Field(default=200, description="Maximum lines of context to send to LLM")
     max_symbols_per_batch: int = Field(default=50, description="Maximum symbols to rename in one batch")
     context_padding: int = Field(default=200, description="Lines of context around symbol (legacy, use max_context_lines)")
+    enable_uniquify: bool = Field(default=True, description="Apply binding-name uniquification before analysis")
+    uniquify_timeout_seconds: int = Field(default=300, description="Timeout for binding-name uniquification")
 
     # Output Settings
     output_dir: Optional[Path] = Field(default=None, description="Output directory for deobfuscated files")
