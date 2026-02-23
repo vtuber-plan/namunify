@@ -329,18 +329,13 @@ async def process_file(
     start_scope_idx = 0
 
     try:
-        # Beautify code first (helps with parsing and LLM context)
-        console.print(f"[blue]Beautifying[/blue] {file_path}")
-        beautified_file = beautify_js_file(file_path)
-        debug_log("info", f"Beautified file: {beautified_file}")
-
-        # Read source code (from beautified file if available)
-        source_code = beautified_file.read_text(encoding="utf-8")
-        debug_log("debug", f"Source code length: {len(source_code)} chars")
+        # Read original source code first
+        source_code = file_path.read_text(encoding="utf-8")
+        preprocess_input_file = file_path
 
         # Ensure variable bindings with the same name in different scopes are unique
         if config.enable_uniquify:
-            console.print(f"[blue]Uniquifying variable names[/blue] {beautified_file}")
+            console.print(f"[blue]Uniquifying variable names[/blue] {file_path}")
             uniquified_file = file_path.with_suffix(".uniquified.js")
             uniquified_source = uniquify_binding_names(
                 source_code,
@@ -352,8 +347,19 @@ async def process_file(
                 source_code = uniquified_source
             else:
                 debug_log("info", f"Binding-name uniquification produced no changes: {uniquified_file}")
+            if uniquified_file.exists():
+                preprocess_input_file = uniquified_file
         else:
             debug_log("info", "Binding-name uniquification disabled by configuration")
+
+        # Beautify after uniquification so formatting reflects final identifier names
+        console.print(f"[blue]Beautifying[/blue] {preprocess_input_file}")
+        beautified_file = beautify_js_file(preprocess_input_file)
+        debug_log("info", f"Beautified file: {beautified_file}")
+
+        # Read source code (from beautified file if available)
+        source_code = beautified_file.read_text(encoding="utf-8")
+        debug_log("debug", f"Source code length: {len(source_code)} chars")
 
         generator = CodeGenerator(source_code)
 
@@ -372,6 +378,12 @@ async def process_file(
             parse_result,
             max_context_lines=config.context_padding,
             max_symbols_per_scope=config.max_symbols_per_batch,
+            program_batching_enabled=config.program_batching_enabled,
+            program_max_symbols_per_batch=config.program_max_symbols_per_batch,
+            program_variable_max_assignment_chars=config.program_variable_max_assignment_chars,
+            program_variable_max_assignment_lines=config.program_variable_max_assignment_lines,
+            program_function_max_chars=config.program_function_max_chars,
+            program_function_max_lines=config.program_function_max_lines,
         )
 
         total_symbols = sum(len(s.identifiers) for s in scope_infos)
@@ -422,6 +434,12 @@ async def process_file(
                 "llm_model": config.llm_model,
                 "llm_base_url": config.llm_base_url,
                 "max_symbols_per_batch": config.max_symbols_per_batch,
+                "program_batching_enabled": config.program_batching_enabled,
+                "program_max_symbols_per_batch": config.program_max_symbols_per_batch,
+                "program_variable_max_assignment_chars": config.program_variable_max_assignment_chars,
+                "program_variable_max_assignment_lines": config.program_variable_max_assignment_lines,
+                "program_function_max_chars": config.program_function_max_chars,
+                "program_function_max_lines": config.program_function_max_lines,
                 "context_padding": config.context_padding,
             }
             processing_state = state_manager.create_state(
@@ -468,6 +486,12 @@ async def process_file(
                 current_parse_result,
                 max_context_lines=config.context_padding,
                 max_symbols_per_scope=config.max_symbols_per_batch,
+                program_batching_enabled=config.program_batching_enabled,
+                program_max_symbols_per_batch=config.program_max_symbols_per_batch,
+                program_variable_max_assignment_chars=config.program_variable_max_assignment_chars,
+                program_variable_max_assignment_lines=config.program_variable_max_assignment_lines,
+                program_function_max_chars=config.program_function_max_chars,
+                program_function_max_lines=config.program_function_max_lines,
             )
 
             # Find the first scope with remaining symbols to rename
@@ -825,9 +849,31 @@ def main():
 @click.option("--api-key", help="API key (or set NAMUNIFY_LLM_API_KEY env)")
 @click.option("--base-url", help="Custom API base URL")
 @click.option("--max-symbols", default=50, help="Max symbols per LLM call")
+@click.option("--program-max-symbols", default=10, help="Max top-level symbols per LLM call")
+@click.option(
+    "--program-var-max-chars",
+    default=120,
+    help="Max chars for top-level var/let/const assignment to allow batching",
+)
+@click.option(
+    "--program-var-max-lines",
+    default=2,
+    help="Max lines for top-level var/let/const assignment to allow batching",
+)
+@click.option(
+    "--program-fn-max-chars",
+    default=600,
+    help="Max chars for top-level function declaration to allow batching",
+)
+@click.option(
+    "--program-fn-max-lines",
+    default=20,
+    help="Max lines for top-level function declaration to allow batching",
+)
 @click.option("--context-padding", default=500, help="Lines of context around symbols")
 @click.option("--no-prettier", is_flag=True, help="Disable prettier formatting")
 @click.option("--no-uniquify", is_flag=True, help="Disable binding-name uniquification step")
+@click.option("--no-program-batch", is_flag=True, help="Disable program-scope batching and force single-symbol top-level calls")
 @click.option("--uniquify-timeout", default=300, help="Uniquification timeout in seconds")
 @click.option("--unpack", is_flag=True, help="Unpack webpack bundle first")
 @click.option("--install-webcrack", is_flag=True, help="Install webcrack if needed")
@@ -842,9 +888,15 @@ def deobfuscate(
     api_key: Optional[str],
     base_url: Optional[str],
     max_symbols: int,
+    program_max_symbols: int,
+    program_var_max_chars: int,
+    program_var_max_lines: int,
+    program_fn_max_chars: int,
+    program_fn_max_lines: int,
     context_padding: int,
     no_prettier: bool,
     no_uniquify: bool,
+    no_program_batch: bool,
     uniquify_timeout: int,
     unpack: bool,
     install_webcrack: bool,
@@ -870,6 +922,12 @@ def deobfuscate(
             "provider": provider,
             "model": model,
             "max_symbols": max_symbols,
+            "program_max_symbols": program_max_symbols,
+            "program_var_max_chars": program_var_max_chars,
+            "program_var_max_lines": program_var_max_lines,
+            "program_fn_max_chars": program_fn_max_chars,
+            "program_fn_max_lines": program_fn_max_lines,
+            "program_batching_enabled": not no_program_batch,
             "context_padding": context_padding,
             "prettier_format": not no_prettier,
             "enable_uniquify": not no_uniquify,
@@ -880,6 +938,12 @@ def deobfuscate(
     config_kwargs = {
         "llm_provider": LLMProvider(provider),
         "max_symbols_per_batch": max_symbols,
+        "program_batching_enabled": not no_program_batch,
+        "program_max_symbols_per_batch": program_max_symbols,
+        "program_variable_max_assignment_chars": program_var_max_chars,
+        "program_variable_max_assignment_lines": program_var_max_lines,
+        "program_function_max_chars": program_fn_max_chars,
+        "program_function_max_lines": program_fn_max_lines,
         "context_padding": context_padding,
         "prettier_format": not no_prettier,
         "enable_uniquify": not no_uniquify,
@@ -901,6 +965,12 @@ def deobfuscate(
         "llm_model": config.llm_model,
         "llm_base_url": config.llm_base_url,
         "max_symbols_per_batch": config.max_symbols_per_batch,
+        "program_batching_enabled": config.program_batching_enabled,
+        "program_max_symbols_per_batch": config.program_max_symbols_per_batch,
+        "program_variable_max_assignment_chars": config.program_variable_max_assignment_chars,
+        "program_variable_max_assignment_lines": config.program_variable_max_assignment_lines,
+        "program_function_max_chars": config.program_function_max_chars,
+        "program_function_max_lines": config.program_function_max_lines,
         "context_padding": config.context_padding,
         "prettier_format": config.prettier_format,
         "enable_uniquify": config.enable_uniquify,

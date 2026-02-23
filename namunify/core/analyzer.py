@@ -113,6 +113,12 @@ def analyze_identifiers(
     parse_result: ParseResult,
     max_context_lines: int = 500,
     max_symbols_per_scope: int = 50,
+    program_batching_enabled: bool = True,
+    program_max_symbols_per_batch: int = 30,
+    program_variable_max_assignment_chars: int = 120,
+    program_variable_max_assignment_lines: int = 2,
+    program_function_max_chars: int = 600,
+    program_function_max_lines: int = 20,
 ) -> list[ScopeInfo]:
     """Analyze and group identifiers for renaming.
 
@@ -126,6 +132,12 @@ def analyze_identifiers(
         parse_result: Result of parsing JavaScript code
         max_context_lines: Maximum lines of context around a scope
         max_symbols_per_scope: Maximum symbols before splitting
+        program_batching_enabled: Whether to allow strict batching in program scope
+        program_max_symbols_per_batch: Max symbols per program-level batch
+        program_variable_max_assignment_chars: Max chars for top-level var/let/const assignment
+        program_variable_max_assignment_lines: Max lines for top-level var/let/const assignment
+        program_function_max_chars: Max chars for top-level function declaration
+        program_function_max_lines: Max lines for top-level function declaration
 
     Returns:
         List of ScopeInfo objects ready for LLM processing
@@ -180,6 +192,23 @@ def analyze_identifiers(
         if scope_info.merged:
             continue
 
+        if scope_info.scope_type == "program":
+            result.extend(
+                _split_program_scope_with_constraints(
+                    scope_info=scope_info,
+                    scopes=scopes,
+                    lines=lines,
+                    allow_batching=program_batching_enabled,
+                    max_symbols=max_symbols_per_scope,
+                    program_max_symbols=program_max_symbols_per_batch,
+                    variable_max_chars=program_variable_max_assignment_chars,
+                    variable_max_lines=program_variable_max_assignment_lines,
+                    function_max_chars=program_function_max_chars,
+                    function_max_lines=program_function_max_lines,
+                )
+            )
+            continue
+
         if _can_batch_in_scope(scope_info.scope_type):
             if len(scope_info.identifiers) > max_symbols_per_scope:
                 # Split into smaller chunks within the same scope range
@@ -206,6 +235,190 @@ def _can_batch_in_scope(scope_type: str) -> bool:
     We only forbid batching at global program scope.
     """
     return scope_type != "program"
+
+
+def _split_program_scope_with_constraints(
+    scope_info: ScopeInfo,
+    scopes: dict,
+    lines: list[str],
+    allow_batching: bool,
+    max_symbols: int,
+    program_max_symbols: int,
+    variable_max_chars: int,
+    variable_max_lines: int,
+    function_max_chars: int,
+    function_max_lines: int,
+) -> list[ScopeInfo]:
+    """Split program scope with strict batching rules for top-level symbols."""
+    if not scope_info.identifiers:
+        return []
+
+    if not allow_batching:
+        return _split_scope_to_singletons(scope_info) if len(scope_info.identifiers) > 1 else [scope_info]
+
+    eligible: list[IdentifierInfo] = []
+    ineligible: list[IdentifierInfo] = []
+
+    for identifier in scope_info.identifiers:
+        if _is_program_batch_eligible(
+            identifier=identifier,
+            scope_info=scope_info,
+            scopes=scopes,
+            lines=lines,
+            variable_max_chars=variable_max_chars,
+            variable_max_lines=variable_max_lines,
+            function_max_chars=function_max_chars,
+            function_max_lines=function_max_lines,
+        ):
+            eligible.append(identifier)
+        else:
+            ineligible.append(identifier)
+
+    chunks: list[ScopeInfo] = []
+
+    # Keep a strict cap for top-level batching.
+    effective_max = max(1, min(max_symbols, program_max_symbols))
+    for i in range(0, len(eligible), effective_max):
+        batch_identifiers = eligible[i:i + effective_max]
+        chunk = ScopeInfo(
+            scope_id=f"{scope_info.scope_id}_program_batch_{i // effective_max}",
+            scope_type=scope_info.scope_type,
+            range=scope_info.range,
+            identifiers=batch_identifiers,
+            parent_scope_id=scope_info.parent_scope_id,
+            child_scope_ids=scope_info.child_scope_ids.copy(),
+        )
+        if batch_identifiers and scope_info.identifiers:
+            batch_identifiers[0].context_before = scope_info.identifiers[0].context_before
+        chunks.append(chunk)
+
+    if ineligible:
+        singleton_scope = ScopeInfo(
+            scope_id=f"{scope_info.scope_id}_program_ineligible",
+            scope_type=scope_info.scope_type,
+            range=scope_info.range,
+            identifiers=ineligible,
+            parent_scope_id=scope_info.parent_scope_id,
+            child_scope_ids=scope_info.child_scope_ids.copy(),
+        )
+        chunks.extend(_split_scope_to_singletons(singleton_scope))
+
+    return chunks
+
+
+def _is_program_batch_eligible(
+    identifier: IdentifierInfo,
+    scope_info: ScopeInfo,
+    scopes: dict,
+    lines: list[str],
+    variable_max_chars: int,
+    variable_max_lines: int,
+    function_max_chars: int,
+    function_max_lines: int,
+) -> bool:
+    """Whether a program-scope identifier is safe to include in top-level batching."""
+    if identifier.binding_type == "function":
+        return _is_small_top_level_function(
+            identifier=identifier,
+            scope_info=scope_info,
+            scopes=scopes,
+            lines=lines,
+            max_chars=function_max_chars,
+            max_lines=function_max_lines,
+        )
+
+    if identifier.binding_type == "variable":
+        return _is_small_top_level_assignment(
+            identifier=identifier,
+            lines=lines,
+            max_chars=variable_max_chars,
+            max_lines=variable_max_lines,
+        )
+
+    # Classes/others are conservative: keep as singleton.
+    return False
+
+
+def _is_small_top_level_function(
+    identifier: IdentifierInfo,
+    scope_info: ScopeInfo,
+    scopes: dict,
+    lines: list[str],
+    max_chars: int,
+    max_lines: int,
+) -> bool:
+    """Allow batching only for short function declarations in program scope."""
+    scope_obj = scopes.get(scope_info.scope_id)
+    if scope_obj is None:
+        return False
+
+    target_scope = None
+    for child_id in scope_obj.children:
+        child = scopes.get(child_id)
+        if child is None:
+            continue
+        if child.scope_type not in {"function", "arrow"}:
+            continue
+        if child.range.start.row != identifier.line:
+            continue
+        target_scope = child
+        break
+
+    if target_scope is None:
+        return False
+
+    start_line = max(0, target_scope.range.start.row)
+    end_line = min(len(lines) - 1, target_scope.range.end.row)
+    if end_line < start_line:
+        return False
+
+    line_count = end_line - start_line + 1
+    if line_count > max_lines:
+        return False
+
+    char_count = sum(len(lines[i]) + 1 for i in range(start_line, end_line + 1))
+    return char_count <= max_chars
+
+
+def _is_small_top_level_assignment(
+    identifier: IdentifierInfo,
+    lines: list[str],
+    max_chars: int,
+    max_lines: int,
+) -> bool:
+    """Allow batching only for short, closed top-level var/let/const assignments."""
+    if not (0 <= identifier.line < len(lines)):
+        return False
+
+    head_line = lines[identifier.line]
+    if not re.search(r"\b(?:var|let|const)\b", head_line):
+        return False
+
+    statement_lines = []
+    end_found = False
+    scan_limit = max(1, max_lines + 2)
+    for i in range(identifier.line, min(len(lines), identifier.line + scan_limit)):
+        statement_lines.append(lines[i])
+        if ";" in lines[i]:
+            end_found = True
+            break
+
+    if not end_found:
+        return False
+
+    line_count = len(statement_lines)
+    if line_count > max_lines:
+        return False
+
+    statement_text = "\n".join(statement_lines)
+    if "=" not in statement_text:
+        return False
+
+    # Keep assignment expressions simple for safer batch prompts.
+    if "function" in statement_text or "=>" in statement_text:
+        return False
+
+    return len(statement_text) <= max_chars
 
 
 def _prepare_scope_context(

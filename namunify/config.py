@@ -40,6 +40,24 @@ class Config(BaseSettings):
     max_context_size: int = Field(default=32000, description="Maximum context size for LLM (in characters)")
     max_context_lines: int = Field(default=200, description="Maximum lines of context to send to LLM")
     max_symbols_per_batch: int = Field(default=50, description="Maximum symbols to rename in one batch")
+    program_batching_enabled: bool = Field(default=True, description="Allow strict batching for top-level program scope")
+    program_max_symbols_per_batch: int = Field(default=10, description="Maximum top-level symbols per LLM call")
+    program_variable_max_assignment_chars: int = Field(
+        default=120,
+        description="Max chars for top-level var/let/const assignment to be batch-eligible",
+    )
+    program_variable_max_assignment_lines: int = Field(
+        default=2,
+        description="Max lines for top-level var/let/const assignment to be batch-eligible",
+    )
+    program_function_max_chars: int = Field(
+        default=600,
+        description="Max chars for top-level function declaration to be batch-eligible",
+    )
+    program_function_max_lines: int = Field(
+        default=20,
+        description="Max lines for top-level function declaration to be batch-eligible",
+    )
     context_padding: int = Field(default=200, description="Lines of context around symbol (legacy, use max_context_lines)")
     enable_uniquify: bool = Field(default=True, description="Apply binding-name uniquification before analysis")
     uniquify_timeout_seconds: int = Field(default=300, description="Timeout for binding-name uniquification")

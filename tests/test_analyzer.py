@@ -133,15 +133,53 @@ function outer() {
         # Should have multiple scopes
         assert len(scopes) >= 1
 
-    def test_program_scope_is_never_batched(self):
-        """Program scope should not batch multiple symbols together."""
+    def test_program_scope_can_batch_small_symbols_under_strict_limits(self):
+        """Program scope can batch only small top-level assignments/functions."""
         code = """
 var a = 1;
 var b = 2;
-var c = 3;
+function c() {
+    return a + b;
+}
 """
         result = parse_javascript(code)
-        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+        scopes = analyze_identifiers(
+            result,
+            max_symbols_per_scope=50,
+            program_batching_enabled=True,
+            program_max_symbols_per_batch=20,
+            program_variable_max_assignment_chars=80,
+            program_variable_max_assignment_lines=2,
+            program_function_max_chars=200,
+            program_function_max_lines=10,
+        )
+
+        program_scopes = [s for s in scopes if s.scope_type == "program"]
+        assert program_scopes
+        assert any(len(scope.identifiers) > 1 for scope in program_scopes)
+
+    def test_program_scope_large_symbols_fall_back_to_singletons(self):
+        """Large top-level assignments/functions should stay single-symbol."""
+        code = """
+var a = veryLongExpressionCall(alpha, beta, gamma, delta, epsilon);
+function b() {
+    var x = 1;
+    var y = 2;
+    var z = 3;
+    return x + y + z;
+}
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(
+            result,
+            max_symbols_per_scope=50,
+            program_batching_enabled=True,
+            program_max_symbols_per_batch=20,
+            program_variable_max_assignment_chars=20,
+            program_variable_max_assignment_lines=1,
+            program_function_max_chars=40,
+            program_function_max_lines=2,
+        )
 
         program_scopes = [s for s in scopes if s.scope_type == "program"]
         assert program_scopes
