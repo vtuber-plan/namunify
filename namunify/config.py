@@ -138,7 +138,7 @@ Snippet where it appears:
 Provide a single meaningful name for this variable. Output format:
 ```json
 {{
-  "symbolName": "meaningfulName"
+  "{symbol_key}": "meaningfulName"
 }}
 ```""",
 }

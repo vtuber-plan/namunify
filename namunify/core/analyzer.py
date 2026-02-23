@@ -5,11 +5,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from namunify.core.parser import (
-    BindingIdentifier,
     ParseResult,
-    Position,
     Range,
-    Scope,
 )
 
 
@@ -109,8 +106,8 @@ def analyze_identifiers(
     This function:
     1. Filters identifiers to only obfuscated ones
     2. Groups them by scope
-    3. Merges small nested scopes into parent scopes
-    4. Prepares context for each scope
+    3. Prepares context for each scope
+    4. Applies batching constraints by scope type
 
     Args:
         parse_result: Result of parsing JavaScript code
@@ -158,9 +155,6 @@ def analyze_identifiers(
         )
         scope_infos[scope_id] = scope_info
 
-    # Merge small nested scopes into parents
-    _merge_nested_scopes(scope_infos)
-
     # Prepare context for each scope
     for scope_info in scope_infos.values():
         if scope_info.merged:
@@ -173,58 +167,28 @@ def analyze_identifiers(
         if scope_info.merged:
             continue
 
-        if len(scope_info.identifiers) > max_symbols_per_scope:
-            # Split into smaller chunks
-            chunks = _split_large_scope(scope_info, max_symbols_per_scope)
-            result.extend(chunks)
+        if _can_batch_in_scope(scope_info.scope_type):
+            if len(scope_info.identifiers) > max_symbols_per_scope:
+                # Split into smaller chunks within the same scope range
+                chunks = _split_large_scope(scope_info, max_symbols_per_scope)
+                result.extend(chunks)
+            else:
+                result.append(scope_info)
+            continue
+
+        # Non function/class scope: never batch multiple symbols together.
+        # This explicitly prevents program-level batching.
+        if len(scope_info.identifiers) > 1:
+            result.extend(_split_scope_to_singletons(scope_info))
         else:
             result.append(scope_info)
 
     return result
 
 
-def _merge_nested_scopes(scope_infos: dict[str, ScopeInfo]) -> None:
-    """Merge small nested scopes into their parent scopes.
-
-    If a child scope is completely contained within a parent scope
-    and the parent scope only contains variable/constant bindings,
-    merge the child's identifiers into the parent.
-    """
-    # Build parent-child relationships
-    for scope_info in scope_infos.values():
-        if scope_info.parent_scope_id and scope_info.parent_scope_id in scope_infos:
-            parent = scope_infos[scope_info.parent_scope_id]
-            if scope_info.scope_id not in parent.child_scope_ids:
-                parent.child_scope_ids.append(scope_info.scope_id)
-
-    # Process scopes from innermost to outermost
-    scopes_to_process = sorted(
-        scope_infos.values(),
-        key=lambda s: len(s.child_scope_ids),
-        reverse=True,
-    )
-
-    for scope_info in scopes_to_process:
-        if scope_info.merged:
-            continue
-
-        # Check if this scope should be merged into parent
-        if scope_info.parent_scope_id and scope_info.parent_scope_id in scope_infos:
-            parent = scope_infos[scope_info.parent_scope_id]
-
-            # Only merge if parent is a function/class/program scope
-            # and child is a block scope
-            if (parent.scope_type in ("function", "method", "class", "program") and
-                scope_info.scope_type in ("block", "catch")):
-                # Merge identifiers
-                parent.identifiers.extend(scope_info.identifiers)
-                # Expand parent range to include child
-                if scope_info.range.start < parent.range.start:
-                    parent.range.start = scope_info.range.start
-                if scope_info.range.end > parent.range.end:
-                    parent.range.end = scope_info.range.end
-                # Mark child as merged
-                scope_info.merged = True
+def _can_batch_in_scope(scope_type: str) -> bool:
+    """Whether this scope type can contain multi-symbol batches."""
+    return scope_type in ("function", "method", "arrow", "class")
 
 
 def _prepare_scope_context(
@@ -293,6 +257,26 @@ def _split_large_scope(
         if chunk_identifiers:
             chunk_identifiers[0].context_before = scope_info.identifiers[0].context_before
 
+        chunks.append(chunk)
+
+    return chunks
+
+
+def _split_scope_to_singletons(scope_info: ScopeInfo) -> list[ScopeInfo]:
+    """Split scope so each chunk contains exactly one identifier."""
+    chunks = []
+    for i, identifier in enumerate(scope_info.identifiers):
+        if not identifier.context_before and scope_info.identifiers:
+            identifier.context_before = scope_info.identifiers[0].context_before
+
+        chunk = ScopeInfo(
+            scope_id=f"{scope_info.scope_id}_single_{i}",
+            scope_type=scope_info.scope_type,
+            range=scope_info.range,
+            identifiers=[identifier],
+            parent_scope_id=scope_info.parent_scope_id,
+            child_scope_ids=scope_info.child_scope_ids.copy(),
+        )
         chunks.append(chunk)
 
     return chunks

@@ -103,6 +103,7 @@ class BaseLLMClient(ABC):
             prompt = PROMPTS["rename_single_symbol"].format(
                 context=context,
                 symbol=symbol + line_info,
+                symbol_key=symbol,
                 snippet=snippet,
             )
         else:

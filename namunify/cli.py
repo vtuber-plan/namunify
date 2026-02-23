@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from tqdm import tqdm
 from namunify import __version__
 from namunify.config import Config, LLMProvider
 from namunify.core import analyze_identifiers, parse_javascript, unpack_webpack
-from namunify.core.generator import CodeGenerator
+from namunify.core.generator import CodeGenerator, uniquify_binding_names
 from namunify.core.webcrack import beautify_js_file
 from namunify.llm import AnthropicClient, OpenAIClient
 from namunify.plugins import BeautifyPlugin, PluginChain
@@ -101,6 +102,112 @@ def create_llm_client(config: Config):
         raise ValueError(f"Unsupported LLM provider: {config.llm_provider}")
 
 
+def _find_identifier_occurrence_lines(lines: list[str], identifier: str) -> list[int]:
+    """Find likely identifier occurrence lines (0-indexed)."""
+    if not identifier:
+        return []
+
+    # Avoid matching member access like obj.foo by excluding dot before identifier.
+    pattern = re.compile(rf"(?<![A-Za-z0-9_$.]){re.escape(identifier)}(?![A-Za-z0-9_$])")
+    return [idx for idx, line in enumerate(lines) if pattern.search(line)]
+
+
+def _line_window(center: int, radius: int, total_lines: int) -> list[int]:
+    """Get a bounded line window around a center line."""
+    if total_lines <= 0:
+        return []
+    start = max(0, center - radius)
+    end = min(total_lines, center + radius + 1)
+    return list(range(start, end))
+
+
+def _format_line_block(lines: list[str], line_numbers: list[int]) -> str:
+    """Format selected line numbers with 1-based line labels."""
+    return "\n".join(f"{line_no + 1:6d} | {lines[line_no]}" for line_no in line_numbers)
+
+
+def _build_global_symbol_context(
+    lines: list[str],
+    symbol: str,
+    declaration_line: int,
+    max_context_lines: int,
+    declaration_window: int = 12,
+    reference_window: int = 2,
+    max_reference_points: int = 10,
+) -> str:
+    """Build focused context for a global symbol using declaration + reference snippets."""
+    total_lines = len(lines)
+    if total_lines == 0:
+        return ""
+
+    decl_line = min(max(0, declaration_line), total_lines - 1)
+    all_occurrences = _find_identifier_occurrence_lines(lines, symbol)
+    reference_lines = [line for line in all_occurrences if line != decl_line][:max_reference_points]
+
+    selected_set: set[int] = set()
+    selected_ordered: list[int] = []
+
+    def add_lines(candidates: list[int]) -> None:
+        for line_no in candidates:
+            if line_no in selected_set:
+                continue
+            if len(selected_ordered) >= max_context_lines:
+                return
+            selected_set.add(line_no)
+            selected_ordered.append(line_no)
+
+    add_lines(_line_window(decl_line, declaration_window, total_lines))
+    for ref_line in reference_lines:
+        add_lines(_line_window(ref_line, reference_window, total_lines))
+        if len(selected_ordered) >= max_context_lines:
+            break
+
+    selected_ordered.sort()
+    reference_lines_1_based = ", ".join(str(line + 1) for line in reference_lines) if reference_lines else "none"
+
+    header = (
+        f"Global symbol: {symbol}\n"
+        f"Declaration line: {decl_line + 1}\n"
+        f"Reference lines: {reference_lines_1_based}\n"
+    )
+    return header + _format_line_block(lines, selected_ordered)
+
+
+def _build_global_symbol_snippet(
+    lines: list[str],
+    symbol: str,
+    declaration_line: int,
+    snippet_radius: int = 3,
+    max_reference_snippets: int = 3,
+) -> str:
+    """Build snippet containing declaration and several reference snippets for a global symbol."""
+    total_lines = len(lines)
+    if total_lines == 0:
+        return ""
+
+    decl_line = min(max(0, declaration_line), total_lines - 1)
+    occurrences = _find_identifier_occurrence_lines(lines, symbol)
+    ref_lines = [line for line in occurrences if line != decl_line][:max_reference_snippets]
+
+    parts = []
+    decl_block_lines = _line_window(decl_line, snippet_radius, total_lines)
+    decl_block = []
+    for line_no in decl_block_lines:
+        marker = " >>> " if line_no == decl_line else "     "
+        decl_block.append(f"{marker}{line_no + 1:6d} | {lines[line_no]}")
+    parts.append("Declaration:\n" + "\n".join(decl_block))
+
+    for idx, ref_line in enumerate(ref_lines, start=1):
+        ref_block_lines = _line_window(ref_line, snippet_radius, total_lines)
+        ref_block = []
+        for line_no in ref_block_lines:
+            marker = " >>> " if line_no == ref_line else "     "
+            ref_block.append(f"{marker}{line_no + 1:6d} | {lines[line_no]}")
+        parts.append(f"Reference {idx} (line {ref_line + 1}):\n" + "\n".join(ref_block))
+
+    return "\n\n".join(parts)
+
+
 async def process_file(
     file_path: Path,
     config: Config,
@@ -141,6 +248,15 @@ async def process_file(
         # Read source code (from beautified file if available)
         source_code = beautified_file.read_text(encoding="utf-8")
         debug_log("debug", f"Source code length: {len(source_code)} chars")
+
+        # Ensure variable bindings with the same name in different scopes are unique
+        console.print(f"[blue]Uniquifying variable names[/blue] {beautified_file}")
+        uniquified_source = uniquify_binding_names(source_code)
+        if uniquified_source != source_code:
+            debug_log("info", "Applied binding-name uniquification")
+            source_code = uniquified_source
+        else:
+            debug_log("info", "Binding-name uniquification produced no changes")
 
         generator = CodeGenerator(source_code)
 
@@ -275,7 +391,17 @@ async def process_file(
                 current_lines = current_source.split("\n")
                 scope_line_count = scope_info.range.end.row - scope_info.range.start.row + 1
 
-                if scope_line_count <= MAX_CONTEXT_LINES:
+                if scope_info.scope_type == "program" and len(symbols) == 1:
+                    # Global symbol: use focused declaration context + reference snippets.
+                    symbol = symbols[0]
+                    declaration_line = symbol_lines.get(symbol, 1) - 1
+                    context = _build_global_symbol_context(
+                        current_lines,
+                        symbol,
+                        declaration_line,
+                        max_context_lines=MAX_CONTEXT_LINES,
+                    )
+                elif scope_line_count <= MAX_CONTEXT_LINES:
                     # Small scope: include entire scope with padding
                     context_start = max(0, scope_info.range.start.row - 10)
                     context_end = min(len(current_lines), scope_info.range.end.row + 10)
@@ -311,13 +437,20 @@ async def process_file(
                     if id_info.name not in remaining_symbol_names:
                         continue
                     id_line = id_info.line
-                    snippet_start = max(0, id_line - 3)
-                    snippet_end = min(len(current_lines), id_line + 4)
-                    snippet_lines = []
-                    for i in range(snippet_start, snippet_end):
-                        marker = " >>> " if i == id_line else "     "
-                        snippet_lines.append(f"{marker}{i + 1:6d} | {current_lines[i]}")
-                    snippets[id_info.name] = "\n".join(snippet_lines)
+                    if scope_info.scope_type == "program":
+                        snippets[id_info.name] = _build_global_symbol_snippet(
+                            current_lines,
+                            id_info.name,
+                            id_line,
+                        )
+                    else:
+                        snippet_start = max(0, id_line - 3)
+                        snippet_end = min(len(current_lines), id_line + 4)
+                        snippet_lines = []
+                        for i in range(snippet_start, snippet_end):
+                            marker = " >>> " if i == id_line else "     "
+                            snippet_lines.append(f"{marker}{i + 1:6d} | {current_lines[i]}")
+                        snippets[id_info.name] = "\n".join(snippet_lines)
 
                 debug_log("info", f"\n{'='*60}")
                 debug_log("info", f"Processing scope: {scope_info.scope_id}", {
@@ -346,30 +479,65 @@ async def process_file(
                         "symbols_returned": list(renames.keys()),
                     })
 
-                    # Apply renames
-                    generator.apply_renames(renames)
-                    stats["symbols_renamed"] += len(renames)
-                    all_renames.update(renames)
+                    # Keep only renames that match current requested symbols.
+                    # This prevents progress inflation when LLM returns unrelated keys.
+                    filtered_renames: dict[str, str] = {}
+                    resolved_symbols: set[str] = set()
+                    for symbol in symbols:
+                        if symbol in renames:
+                            filtered_renames[symbol] = renames[symbol]
+                            resolved_symbols.add(symbol)
+                            continue
+
+                        if symbol_lines and symbol in symbol_lines:
+                            line_key = f"{symbol}:{symbol_lines[symbol]}"
+                            if line_key in renames:
+                                filtered_renames[line_key] = renames[line_key]
+                                resolved_symbols.add(symbol)
+                                continue
+
+                        # Fallback for single-symbol mode: accept a single returned rename value
+                        # even if the key is not exact (e.g., "symbolName").
+                        if len(symbols) == 1 and len(renames) == 1:
+                            only_value = next(iter(renames.values()))
+                            if isinstance(only_value, str) and only_value.strip():
+                                filtered_renames[symbol] = only_value.strip()
+                                resolved_symbols.add(symbol)
+
+                    if not filtered_renames:
+                        debug_log("warning", "No usable renames returned for requested symbols", {
+                            "symbols_requested": symbols,
+                            "symbols_returned": list(renames.keys()),
+                        })
+                        # Avoid infinite loop on unusable model output.
+                        for symbol in symbols:
+                            remaining_symbol_names.discard(symbol)
+                        pbar.update(len(symbols))
+                        pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
+                        continue
+
+                    # Apply validated renames
+                    generator.apply_renames(filtered_renames)
+                    stats["symbols_renamed"] += len(resolved_symbols)
+                    all_renames.update(filtered_renames)
 
                     # Remove renamed symbols from remaining
-                    for renamed_symbol in renames.keys():
-                        # Handle both "name" and "name:line" format
-                        base_name = renamed_symbol.split(":")[0]
-                        remaining_symbol_names.discard(base_name)
-                        remaining_symbol_names.discard(renamed_symbol)
+                    for resolved_symbol in resolved_symbols:
+                        remaining_symbol_names.discard(resolved_symbol)
 
                     # Save checkpoint state
                     state_manager._current_state.all_renames = all_renames.copy()
                     state_manager._current_state.processed_scopes = len(scope_infos) - len(remaining_symbol_names)
                     state_manager.save_state(state_manager._current_state)
 
-                    debug_log("info", f"Applied {len(renames)} renames, checkpoint saved", {
+                    debug_log("info", f"Applied {len(filtered_renames)} renames, checkpoint saved", {
                         "total_renamed": stats["symbols_renamed"],
+                        "resolved_symbols_count": len(resolved_symbols),
                         "remaining": list(remaining_symbol_names),
                     })
 
                     # Update progress bar
-                    pbar.update(len(renames))
+                    pbar.update(len(resolved_symbols))
                     pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
 
                 except Exception as e:

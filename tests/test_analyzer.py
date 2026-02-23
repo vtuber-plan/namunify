@@ -1,7 +1,5 @@
 """Tests for analyzer module."""
 
-import pytest
-
 from namunify.core.analyzer import (
     IdentifierInfo,
     ScopeInfo,
@@ -125,6 +123,57 @@ function outer() {
 
         # Should have multiple scopes
         assert len(scopes) >= 1
+
+    def test_program_scope_is_never_batched(self):
+        """Program scope should not batch multiple symbols together."""
+        code = """
+var a = 1;
+var b = 2;
+var c = 3;
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+
+        program_scopes = [s for s in scopes if s.scope_type == "program"]
+        assert program_scopes
+        assert all(len(scope.identifiers) == 1 for scope in program_scopes)
+
+    def test_function_scope_can_batch_symbols(self):
+        """Function scope can include multiple symbols in one batch."""
+        code = """
+function f(a, b) {
+    var c = a + b;
+    return c;
+}
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+
+        function_scopes = [s for s in scopes if s.scope_type in {"function", "method", "arrow", "class"}]
+        assert function_scopes
+        assert any(len(scope.identifiers) > 1 for scope in function_scopes)
+
+    def test_block_scope_not_merged_into_function(self):
+        """Nested block scope identifiers should remain in block scope."""
+        code = """
+function f() {
+    for (var a = 0; a < 1; a++) {
+        var b = a;
+    }
+}
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+
+        block_scopes = [s for s in scopes if s.scope_type == "block"]
+
+        assert block_scopes
+        assert any(any(identifier.name == "b" for identifier in s.identifiers) for s in block_scopes)
+        assert all(
+            all(identifier.name != "b" for identifier in s.identifiers)
+            for s in scopes
+            if s.scope_type != "block"
+        )
 
 
 class TestScopeInfo:

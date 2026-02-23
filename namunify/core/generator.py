@@ -93,6 +93,56 @@ def generate_code(
         output_file.unlink(missing_ok=True)
 
 
+def uniquify_binding_names(source_code: str) -> str:
+    """Rename duplicated binding names so each binding name is globally unique.
+
+    Args:
+        source_code: Source code to process
+
+    Returns:
+        Source code with uniquely named bindings
+    """
+    if not source_code:
+        return source_code
+
+    if not check_node_available():
+        console.print("[yellow]Node.js not available, skipping binding uniquification[/yellow]")
+        return source_code
+
+    # Write source to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+        f.write(source_code)
+        input_file = Path(f.name)
+
+    # Write output to temp file
+    output_file = input_file.with_suffix('.uniquified.js')
+
+    try:
+        uniquify_script = _SCRIPTS_DIR / "uniquify_bindings.mjs"
+        result = subprocess.run(
+            ["node", str(uniquify_script), str(input_file), str(output_file)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        if result.returncode == 0 and output_file.exists():
+            return output_file.read_text(encoding="utf-8")
+
+        console.print(f"[yellow]Binding uniquification warning: {result.stderr}[/yellow]")
+        return source_code
+
+    except subprocess.TimeoutExpired:
+        console.print("[yellow]Binding uniquification timed out[/yellow]")
+        return source_code
+    except Exception as e:
+        console.print(f"[yellow]Binding uniquification error: {e}[/yellow]")
+        return source_code
+    finally:
+        input_file.unlink(missing_ok=True)
+        output_file.unlink(missing_ok=True)
+
+
 async def format_with_prettier(code: str, file_path: Optional[Path] = None) -> str:
     """Format code using prettier.
 

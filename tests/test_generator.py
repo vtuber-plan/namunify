@@ -1,11 +1,17 @@
 """Tests for generator module."""
 
+import shutil
+
 import pytest
 
 from namunify.core.generator import (
     CodeGenerator,
     generate_code,
+    uniquify_binding_names,
 )
+from namunify.core.parser import parse_javascript
+
+NODE_AVAILABLE = shutil.which("node") is not None
 
 
 class TestGenerateCode:
@@ -141,3 +147,39 @@ class TestCodeGenerator:
         result = gen.get_current_source()
         assert "value" in result
         assert "second_a" in result
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="Node.js is required for Babel-based transforms")
+class TestUniquifyBindingNames:
+    """Tests for automatic binding-name uniquification."""
+
+    def test_uniquify_same_names_across_scopes(self):
+        """Bindings with same names in different scopes should become unique."""
+        code = """
+function first(a) {
+  const b = a + 1;
+  return b;
+}
+
+function second(a) {
+  const b = a + 2;
+  return b;
+}
+"""
+        result = uniquify_binding_names(code)
+        parse_result = parse_javascript(result)
+        binding_names = [binding.name for binding in parse_result.all_bindings]
+
+        assert len(binding_names) == len(set(binding_names))
+        assert any("__u" in name for name in binding_names)
+
+    def test_keep_unique_bindings_stable(self):
+        """Already-unique bindings should not get rewritten."""
+        code = "function run(alpha) { const beta = alpha + 1; return beta; }"
+        result = uniquify_binding_names(code)
+        parse_result = parse_javascript(result)
+        binding_names = {binding.name for binding in parse_result.all_bindings}
+
+        assert "run" in binding_names
+        assert "alpha" in binding_names
+        assert "beta" in binding_names
