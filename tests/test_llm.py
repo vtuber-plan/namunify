@@ -102,6 +102,67 @@ class TestOpenAIClient:
 
         await client.close()
 
+    def test_extract_content_from_standard_choices_response(self):
+        """Should extract text from standard chat completion choices."""
+        from types import SimpleNamespace
+        from namunify.llm.openai_client import OpenAIClient
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"a":"name"}')
+                )
+            ]
+        )
+        assert OpenAIClient._extract_content_from_response(response) == '{"a":"name"}'
+
+    def test_extract_content_from_structured_message_content(self):
+        """Should extract and join text blocks when content is a list."""
+        from types import SimpleNamespace
+        from namunify.llm.openai_client import OpenAIClient
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=[
+                            {"type": "text", "text": '{"a":"'},
+                            {"type": "text", "text": 'name"}'},
+                        ]
+                    )
+                )
+            ]
+        )
+        assert OpenAIClient._extract_content_from_response(response) == '{"a":"name"}'
+
+    def test_extract_content_from_output_text_fallback(self):
+        """Should fallback to output_text for compatible APIs."""
+        from types import SimpleNamespace
+        from namunify.llm.openai_client import OpenAIClient
+
+        response = SimpleNamespace(choices=None, output_text='{"a":"name"}')
+        assert OpenAIClient._extract_content_from_response(response) == '{"a":"name"}'
+
+    def test_describe_unusable_response_with_provider_details(self):
+        """Should expose gateway-style status/msg errors for diagnostics."""
+        from types import SimpleNamespace
+        from namunify.llm.openai_client import OpenAIClient
+
+        class MockResponse:
+            def model_dump(self):
+                return {"status": "434", "msg": "Invalid apiKey", "body": None}
+
+        detail = OpenAIClient._describe_unusable_response(MockResponse())
+        assert "status=434" in detail
+        assert "msg=Invalid apiKey" in detail
+
+    def test_openai_retryable_error_detection(self):
+        """429 throttling should be recognized as retryable by client."""
+        from namunify.llm.openai_client import OpenAIClient
+
+        err = Exception("Error code: 429 - {'message': 'Throttling: TPM'}")
+        assert OpenAIClient._is_retryable_error(err) is True
+
 
 class TestAnthropicClient:
     """Tests for Anthropic client (mocked)."""

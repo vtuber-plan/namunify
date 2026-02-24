@@ -58,6 +58,10 @@ class Config(BaseSettings):
         default=20,
         description="Max lines for top-level function declaration to be batch-eligible",
     )
+    debug_scope_details: bool = Field(
+        default=False,
+        description="Include full scope details in debug logs (very verbose)",
+    )
     context_padding: int = Field(default=200, description="Lines of context around symbol (legacy, use max_context_lines)")
     enable_uniquify: bool = Field(default=True, description="Apply binding-name uniquification before analysis")
     uniquify_timeout_seconds: int = Field(default=300, description="Timeout for binding-name uniquification")

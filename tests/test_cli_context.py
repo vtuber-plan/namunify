@@ -4,10 +4,15 @@ from namunify.cli import (
     _apply_prompt_size_limits,
     _build_global_symbol_context,
     _build_global_symbol_snippet,
+    _count_binding_names,
     _find_identifier_occurrence_lines,
     _is_input_too_long_error,
+    _is_retryable_llm_error,
+    _normalize_rename_keys_for_unique_bindings,
+    _parse_line_specific_key,
     _truncate_text_middle,
 )
+from namunify.core.parser import parse_javascript
 
 
 class TestGlobalContextHelpers:
@@ -85,3 +90,48 @@ class TestGlobalContextHelpers:
         """Length-related error message should be detected."""
         err = Exception("Range of input length should be [1, 131072]")
         assert _is_input_too_long_error(err) is True
+
+    def test_detect_retryable_llm_error(self):
+        """429/Throttling should be treated as retryable."""
+        err = Exception("Error code: 429 - {'message': 'Throttling: TPM'}")
+        assert _is_retryable_llm_error(err) is True
+
+    def test_parse_line_specific_key(self):
+        """Line-specific rename key should parse only for `name:line`."""
+        assert _parse_line_specific_key("a__u1:42") == ("a__u1", 42)
+        assert _parse_line_specific_key("a__u1") is None
+        assert _parse_line_specific_key("a__u1:x") is None
+
+    def test_normalize_line_specific_renames_for_unique_bindings(self):
+        """Unique binding names should fold `name:line` into plain `name`."""
+        code = """
+var a__u1 = 1;
+function f(a__u2) { return a__u2; }
+"""
+        parse_result = parse_javascript(code)
+        counts = _count_binding_names(parse_result)
+        normalized = _normalize_rename_keys_for_unique_bindings(
+            {"a__u1:2": "firstValue", "a__u2:3": "paramValue"},
+            counts,
+        )
+
+        assert normalized["a__u1"] == "firstValue"
+        assert normalized["a__u2"] == "paramValue"
+        assert "a__u1:2" not in normalized
+        assert "a__u2:3" not in normalized
+
+    def test_normalize_line_specific_renames_keeps_non_unique_name(self):
+        """Non-unique names should keep line-specific keys."""
+        code = """
+var a = 1;
+function f(a) { return a; }
+"""
+        parse_result = parse_javascript(code)
+        counts = _count_binding_names(parse_result)
+        normalized = _normalize_rename_keys_for_unique_bindings(
+            {"a:2": "globalValue", "a:3": "paramValue"},
+            counts,
+        )
+
+        assert normalized["a:2"] == "globalValue"
+        assert normalized["a:3"] == "paramValue"

@@ -170,6 +170,84 @@ def _is_input_too_long_error(exc: Exception) -> bool:
     return any(indicator in message for indicator in indicators)
 
 
+def _is_fatal_llm_response_error(exc: Exception) -> bool:
+    """Whether an LLM response error is fatal and should stop processing."""
+    message = str(exc).lower()
+    indicators = (
+        "openai-compatible api returned no usable content",
+        "openai-compatible api returned unexpected response",
+    )
+    return any(indicator in message for indicator in indicators)
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    """Whether an LLM call failure should be retried instead of skipping symbols."""
+    message = str(exc).lower()
+    indicators = (
+        "error code: 429",
+        "status code: 429",
+        "too many requests",
+        "throttling",
+        "rate limit",
+        "tpm",
+        "rpm",
+        "timeout",
+        "timed out",
+        "connection error",
+        "temporarily unavailable",
+        "service unavailable",
+        "try again later",
+    )
+    return any(indicator in message for indicator in indicators)
+
+
+def _parse_line_specific_key(key: str) -> Optional[tuple[str, int]]:
+    """Parse a rename key in `name:line` format."""
+    if not key:
+        return None
+    name, sep, line_text = key.rpartition(":")
+    if not sep or not name or not line_text.isdigit():
+        return None
+    return name, int(line_text)
+
+
+def _count_binding_names(parse_result) -> dict[str, int]:
+    """Count declaration bindings by name in parse result."""
+    counts: dict[str, int] = {}
+    for binding in parse_result.all_bindings:
+        counts[binding.name] = counts.get(binding.name, 0) + 1
+    return counts
+
+
+def _normalize_rename_keys_for_unique_bindings(
+    renames: dict[str, str],
+    binding_name_counts: dict[str, int],
+) -> dict[str, str]:
+    """Normalize `name:line` keys to `name` when the binding name is globally unique.
+
+    This avoids line-drift mismatches when source formatting changes across iterations.
+    """
+    normalized: dict[str, str] = {}
+
+    # Keep non line-specific keys first.
+    for key, value in renames.items():
+        if _parse_line_specific_key(key) is None:
+            normalized[key] = value
+
+    # Then fold line-specific keys into plain symbol keys when safe.
+    for key, value in renames.items():
+        parsed = _parse_line_specific_key(key)
+        if parsed is None:
+            continue
+        name, _line = parsed
+        if binding_name_counts.get(name, 0) == 1:
+            normalized.setdefault(name, value)
+        else:
+            normalized[key] = value
+
+    return normalized
+
+
 def _line_window(center: int, radius: int, total_lines: int) -> list[int]:
     """Get a bounded line window around a center line."""
     if total_lines <= 0:
@@ -371,6 +449,7 @@ async def process_file(
         # Parse JavaScript
         console.print(f"[blue]Parsing[/blue] {file_path}")
         parse_result = parse_javascript(source_code)
+        initial_binding_name_counts = _count_binding_names(parse_result)
         debug_log("info", f"Parsed {len(parse_result.scopes)} scopes, {len(parse_result.all_bindings)} bindings")
 
         # Analyze identifiers
@@ -390,18 +469,20 @@ async def process_file(
         stats["symbols_found"] = total_symbols
         stats["scopes_processed"] = len(scope_infos)
 
-        debug_log("info", f"Found {total_symbols} obfuscated symbols in {len(scope_infos)} scopes", {
-            "scope_details": [
-                {
-                    "scope_id": s.scope_id,
-                    "scope_type": s.scope_type,
-                    "range": f"lines {s.range.start.row}-{s.range.end.row}",
-                    "symbol_count": len(s.identifiers),
-                    "symbols": [id.name for id in s.identifiers],
-                }
-                for s in scope_infos
-            ]
-        })
+        debug_log("info", f"Found {total_symbols} obfuscated symbols in {len(scope_infos)} scopes")
+        if config.debug_scope_details:
+            debug_log("debug", "Scope details", {
+                "scope_details": [
+                    {
+                        "scope_id": s.scope_id,
+                        "scope_type": s.scope_type,
+                        "range": f"lines {s.range.start.row}-{s.range.end.row}",
+                        "symbol_count": len(s.identifiers),
+                        "symbols": [id.name for id in s.identifiers],
+                    }
+                    for s in scope_infos
+                ]
+            })
 
         console.print(f"[green]Found {total_symbols} obfuscated symbols in {len(scope_infos)} scopes[/green]")
 
@@ -415,12 +496,17 @@ async def process_file(
             if processing_state and ask_resume(processing_state, state_manager):
                 start_scope_idx = processing_state.processed_scopes
                 # Apply already processed renames
-                generator.apply_renames(processing_state.all_renames)
-                stats["symbols_renamed"] = len(processing_state.all_renames)
+                normalized_saved_renames = _normalize_rename_keys_for_unique_bindings(
+                    processing_state.all_renames,
+                    initial_binding_name_counts,
+                )
+                generator.apply_renames(normalized_saved_renames)
+                processing_state.all_renames = normalized_saved_renames
+                stats["symbols_renamed"] = len(normalized_saved_renames)
                 console.print(f"[green]Resuming from scope {start_scope_idx + 1}[/green]")
                 debug_log("info", f"Resuming from checkpoint", {
                     "start_scope_idx": start_scope_idx,
-                    "already_renamed": len(processing_state.all_renames),
+                    "already_renamed_count": len(normalized_saved_renames),
                 })
             else:
                 # User chose not to resume, start fresh
@@ -477,11 +563,13 @@ async def process_file(
             unit="symbol",
             ncols=100,
         )
+        consecutive_retryable_errors = 0
 
         while remaining_symbol_names:
             # Re-parse current source to get updated AST and positions
             current_source = generator.get_current_source()
             current_parse_result = parse_javascript(current_source)
+            current_binding_name_counts = _count_binding_names(current_parse_result)
             current_scope_infos = analyze_identifiers(
                 current_parse_result,
                 max_context_lines=config.context_padding,
@@ -618,7 +706,7 @@ async def process_file(
                     "symbol_lines": symbol_lines,
                     "context_length": len(context),
                     "context_preview": context[:500] + "..." if len(context) > 500 else context,
-                    "already_renamed": list(all_renames.keys()),
+                    "already_renamed_count": len(all_renames),
                     "remaining_count": len(remaining_symbol_names),
                     **global_context_meta,
                 })
@@ -697,6 +785,11 @@ async def process_file(
                         pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
                         continue
 
+                    filtered_renames = _normalize_rename_keys_for_unique_bindings(
+                        filtered_renames,
+                        current_binding_name_counts,
+                    )
+
                     # Apply validated renames
                     generator.apply_renames(filtered_renames)
                     stats["symbols_renamed"] += len(resolved_symbols)
@@ -720,6 +813,7 @@ async def process_file(
                     # Update progress bar
                     pbar.update(len(resolved_symbols))
                     pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
+                    consecutive_retryable_errors = 0
 
                 except Exception as e:
                     import traceback
@@ -730,10 +824,32 @@ async def process_file(
                         "traceback": error_trace,
                         "symbols": symbols,
                     })
-                    console.print(f"[red]Error: {e}[/red]")
-                    # Skip these symbols and continue
-                    for s in symbols:
-                        remaining_symbol_names.discard(s)
+                    if _is_fatal_llm_response_error(e):
+                        console.print(f"[red]Error: {e}[/red]")
+                        raise
+                    if _is_retryable_llm_error(e):
+                        consecutive_retryable_errors += 1
+                        retry_delay = min(60, 2 ** min(consecutive_retryable_errors, 6))
+                        debug_log("warning", "Retryable LLM error, will retry same symbols", {
+                            "error": str(e),
+                            "symbols": symbols,
+                            "retry_delay_seconds": retry_delay,
+                            "consecutive_retryable_errors": consecutive_retryable_errors,
+                        })
+                        console.print(
+                            f"[yellow]Retryable LLM error, retrying in {retry_delay}s: {e}[/yellow]"
+                        )
+                        if consecutive_retryable_errors >= 12:
+                            raise RuntimeError(
+                                "LLM rate limit/connection errors persisted for 12 retries; "
+                                "please lower request rate or retry later."
+                            ) from e
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        console.print(f"[red]Error: {e}[/red]")
+                        # Skip these symbols and continue for non-retryable scope-level failures.
+                        for s in symbols:
+                            remaining_symbol_names.discard(s)
 
                 break  # Exit scope loop after processing first scope with remaining symbols
 
@@ -878,6 +994,7 @@ def main():
 @click.option("--unpack", is_flag=True, help="Unpack webpack bundle first")
 @click.option("--install-webcrack", is_flag=True, help="Install webcrack if needed")
 @click.option("--debug", is_flag=True, help="Enable debug logging to file")
+@click.option("--debug-scope-details", is_flag=True, help="Include full scope details in debug logs (very verbose)")
 @click.option("--debug-file", type=click.Path(path_type=Path), help="Debug log file path (default: namunify_debug_TIMESTAMP.log)")
 @click.option("--no-resume", is_flag=True, help="Disable checkpoint resume, start fresh")
 def deobfuscate(
@@ -901,6 +1018,7 @@ def deobfuscate(
     unpack: bool,
     install_webcrack: bool,
     debug: bool,
+    debug_scope_details: bool,
     debug_file: Optional[Path],
     no_resume: bool,
 ):
@@ -928,6 +1046,7 @@ def deobfuscate(
             "program_fn_max_chars": program_fn_max_chars,
             "program_fn_max_lines": program_fn_max_lines,
             "program_batching_enabled": not no_program_batch,
+            "debug_scope_details": debug_scope_details,
             "context_padding": context_padding,
             "prettier_format": not no_prettier,
             "enable_uniquify": not no_uniquify,
@@ -944,6 +1063,7 @@ def deobfuscate(
         "program_variable_max_assignment_lines": program_var_max_lines,
         "program_function_max_chars": program_fn_max_chars,
         "program_function_max_lines": program_fn_max_lines,
+        "debug_scope_details": debug_scope_details,
         "context_padding": context_padding,
         "prettier_format": not no_prettier,
         "enable_uniquify": not no_uniquify,
@@ -971,6 +1091,7 @@ def deobfuscate(
         "program_variable_max_assignment_lines": config.program_variable_max_assignment_lines,
         "program_function_max_chars": config.program_function_max_chars,
         "program_function_max_lines": config.program_function_max_lines,
+        "debug_scope_details": config.debug_scope_details,
         "context_padding": config.context_padding,
         "prettier_format": config.prettier_format,
         "enable_uniquify": config.enable_uniquify,
