@@ -123,6 +123,8 @@ NAMUNIFY_LLM_BASE_URL=https://api.openai.com/v1
 NAMUNIFY_MAX_CONTEXT_SIZE=32000
 NAMUNIFY_MAX_SYMBOLS_PER_BATCH=50
 NAMUNIFY_PRETTIER_FORMAT=true
+NAMUNIFY_BEAUTIFY_AFTER_EACH_RENAME=false
+NAMUNIFY_RETAIN_LINES_DURING_GENERATE=true
 ```
 
 ## 工作原理
@@ -133,7 +135,7 @@ NAMUNIFY_PRETTIER_FORMAT=true
 4. **Babel AST 解析**: 将代码解析为抽象语法树，识别所有绑定的标识符
 5. **标识符分组**: 按作用域位置分组；全局 program 作用域不做多变量 batch，其他本地作用域可 batch
 6. **LLM 重命名**: 将上下文发送给 LLM，获取新的变量名映射
-7. **代码生成**: 应用重命名，使用 prettier 格式化输出
+7. **代码生成**: 应用重命名（默认保留行布局以减少行号漂移），最终使用 prettier 格式化输出
 
 ## 作为库使用
 
@@ -158,7 +160,11 @@ async def deobfuscate(code: str):
     )
 
     # 代码生成器
-    generator = CodeGenerator(code)
+    generator = CodeGenerator(
+        code,
+        beautify_after_generate=False,  # 每轮生成后可选 beautify
+        retain_lines=True,              # 默认保持行布局，减少行号漂移
+    )
 
     # 处理每个作用域
     for scope in scopes:

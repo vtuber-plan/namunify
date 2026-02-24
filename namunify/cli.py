@@ -697,7 +697,11 @@ async def process_file(
         source_code = beautified_file.read_text(encoding="utf-8")
         debug_log("debug", f"Source code length: {len(source_code)} chars")
 
-        generator = CodeGenerator(source_code)
+        generator = CodeGenerator(
+            source_code,
+            beautify_after_generate=config.beautify_after_each_rename,
+            retain_lines=config.retain_lines_during_generate,
+        )
 
         # Setup plugin chain
         plugin_chain = PluginChain()

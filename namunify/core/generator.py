@@ -29,6 +29,8 @@ def generate_code(
     source_code: str,
     renames: dict[str, str],
     line_specific_renames: Optional[dict[str, str]] = None,
+    beautify: bool = False,
+    retain_lines: bool = True,
 ) -> str:
     """Generate renamed code using Babel AST.
 
@@ -36,6 +38,8 @@ def generate_code(
         source_code: Original source code
         renames: Dict mapping old names to new names
         line_specific_renames: Dict mapping "name:line" to new names
+        beautify: Whether to beautify output after generation
+        retain_lines: Whether to preserve line structure for stable positions
 
     Returns:
         Renamed source code
@@ -55,17 +59,70 @@ def generate_code(
     if not all_renames:
         return source_code
 
-    # Write source to temp file
+    try:
+        return _generate_code_via_stdin(
+            source_code=source_code,
+            all_renames=all_renames,
+            beautify=beautify,
+            retain_lines=retain_lines,
+        )
+    except Exception as stdin_error:
+        # Backward-compatible fallback path.
+        console.print(f"[yellow]Babel stdin generation warning: {stdin_error}[/yellow]")
+        try:
+            return _generate_code_via_temp_files(source_code, all_renames)
+        except Exception as file_mode_error:
+            console.print(f"[yellow]Babel generation error: {file_mode_error}[/yellow]")
+            return source_code
+
+
+def _generate_code_via_stdin(
+    source_code: str,
+    all_renames: dict[str, str],
+    beautify: bool,
+    retain_lines: bool,
+) -> str:
+    """Generate code by streaming payload to Node script via stdin/stdout."""
+    generate_script = _SCRIPTS_DIR / "generate.mjs"
+    payload = {
+        "code": source_code,
+        "renames": all_renames,
+        "options": {
+            "beautify": beautify,
+            "retainLines": retain_lines,
+        },
+    }
+
+    result = subprocess.run(
+        ["node", str(generate_script), "--stdin"],
+        input=json.dumps(payload, ensure_ascii=False),
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "unknown error")
+
+    generated = result.stdout
+    if not generated and source_code:
+        raise RuntimeError("empty stdout from generate.mjs")
+    return generated
+
+
+def _generate_code_via_temp_files(
+    source_code: str,
+    all_renames: dict[str, str],
+) -> str:
+    """Legacy file-based fallback for code generation."""
     with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
         f.write(source_code)
         input_file = Path(f.name)
 
-    # Write renames to temp file
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
         json.dump(all_renames, f)
         renames_file = Path(f.name)
 
-    # Write output to temp file
     output_file = input_file.with_suffix('.generated.js')
 
     try:
@@ -78,20 +135,10 @@ def generate_code(
         )
 
         if result.returncode == 0 and output_file.exists():
-            generated_code = output_file.read_text(encoding="utf-8")
-            return generated_code
-        else:
-            console.print(f"[yellow]Babel generation warning: {result.stderr}[/yellow]")
-            return source_code
+            return output_file.read_text(encoding="utf-8")
 
-    except subprocess.TimeoutExpired:
-        console.print("[yellow]Babel generation timed out[/yellow]")
-        return source_code
-    except Exception as e:
-        console.print(f"[yellow]Babel generation error: {e}[/yellow]")
-        return source_code
+        raise RuntimeError(result.stderr.strip() or "file output missing")
     finally:
-        # Cleanup temp files
         input_file.unlink(missing_ok=True)
         renames_file.unlink(missing_ok=True)
         output_file.unlink(missing_ok=True)
@@ -407,11 +454,18 @@ def save_output(
 class CodeGenerator:
     """Code generator for handling incremental renames using Babel AST."""
 
-    def __init__(self, source_code: str):
+    def __init__(
+        self,
+        source_code: str,
+        beautify_after_generate: bool = False,
+        retain_lines: bool = True,
+    ):
         self.original_source = source_code
         self.current_source = source_code
         self.applied_renames: dict[str, str] = {}
         self.line_specific_renames: dict[str, str] = {}
+        self.beautify_after_generate = beautify_after_generate
+        self.retain_lines = retain_lines
 
     def apply_renames(
         self,
@@ -437,6 +491,8 @@ class CodeGenerator:
             self.original_source,
             self.applied_renames,
             self.line_specific_renames,
+            beautify=self.beautify_after_generate,
+            retain_lines=self.retain_lines,
         )
         return self.current_source
 

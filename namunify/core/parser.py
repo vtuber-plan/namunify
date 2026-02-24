@@ -122,16 +122,11 @@ def parse_javascript(source_code: str) -> ParseResult:
         console.print("[yellow]Babel not available, falling back to regex parsing[/yellow]")
         return _parse_with_regex(source_code)
 
-    # Write source to temp file
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
-        f.write(source_code)
-        temp_path = Path(f.name)
-
     try:
-        # Run the JS parser
+        # Run the JS parser (stream source via stdin to avoid temp-file I/O).
         result = subprocess.run(
-            ["node", str(_JS_PARSER_PATH), str(temp_path)],
+            ["node", str(_JS_PARSER_PATH), "--stdin"],
+            input=source_code,
             capture_output=True,
             text=True,
             timeout=30,
@@ -156,8 +151,6 @@ def parse_javascript(source_code: str) -> ParseResult:
     except Exception as e:
         console.print(f"[yellow]Babel parsing error: {e}[/yellow]")
         return _parse_with_regex(source_code)
-    finally:
-        temp_path.unlink(missing_ok=True)
 
 
 def _convert_babel_result(source_code: str, data: dict) -> ParseResult:

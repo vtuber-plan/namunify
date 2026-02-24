@@ -68,6 +68,14 @@ class Config(BaseSettings):
         default=300,
         description="Stall timeout without JS progress events during binding-name uniquification",
     )
+    beautify_after_each_rename: bool = Field(
+        default=False,
+        description="Beautify each intermediate generate step for more stable formatting",
+    )
+    retain_lines_during_generate: bool = Field(
+        default=True,
+        description="Preserve line layout during AST generation to reduce line drift",
+    )
 
     # Output Settings
     output_dir: Optional[Path] = Field(default=None, description="Output directory for deobfuscated files")

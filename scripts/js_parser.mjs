@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * JavaScript AST Parser using Babel
- * Usage: node js_parser.mjs <input.js> [options]
+ * Usage:
+ *   node js_parser.mjs <input.js>
+ *   node js_parser.mjs --stdin
  * Output: JSON to stdout
  */
 
@@ -9,13 +11,15 @@ import { parse } from '@babel/parser';
 import traverse from '@babel/traverse';
 import fs from 'fs';
 
-const inputPath = process.argv[2];
-if (!inputPath) {
-  console.error('Usage: node js_parser.mjs <input.js>');
+const inputArg = process.argv[2];
+if (!inputArg) {
+  console.error('Usage: node js_parser.mjs <input.js> | --stdin');
   process.exit(1);
 }
 
-const code = fs.readFileSync(inputPath, 'utf-8');
+const code = inputArg === '--stdin'
+  ? fs.readFileSync(0, 'utf-8')
+  : fs.readFileSync(inputArg, 'utf-8');
 const lines = code.split('\n');
 
 // Parse options
@@ -527,5 +531,5 @@ for (const scopeId in allScopes) {
   });
 }
 
-// Output JSON
-console.log(JSON.stringify(result, null, 2));
+// Output JSON (compact to reduce IPC overhead).
+process.stdout.write(JSON.stringify(result));
