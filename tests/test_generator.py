@@ -1,9 +1,12 @@
 """Tests for generator module."""
 
+import json
 import shutil
+from pathlib import Path
 
 import pytest
 
+import namunify.core.generator as generator_module
 from namunify.core.generator import (
     CodeGenerator,
     generate_code,
@@ -147,6 +150,126 @@ class TestCodeGenerator:
         result = gen.get_current_source()
         assert "value" in result
         assert "second_a" in result
+
+
+class TestUniquifyProgress:
+    """Tests for uniquify heartbeat/progress reporting."""
+
+    def test_uniquify_emits_progress_events(self, monkeypatch):
+        """Progress callback should receive started/heartbeat/completed events."""
+        code = "function keep(alpha) { return alpha; }"
+        progress_events = []
+
+        class DummyProcess:
+            def __init__(self):
+                self.returncode = None
+                self._poll_count = 0
+
+            def poll(self):
+                self._poll_count += 1
+                if self._poll_count >= 4:
+                    self.returncode = 0
+                    return 0
+                return None
+
+            def communicate(self):
+                return ("ok", "")
+
+            def kill(self):
+                self.returncode = -9
+
+        def fake_popen(cmd, stdout=None, stderr=None, text=None, bufsize=None):
+            output_file = Path(cmd[3])
+            output_file.write_text(code, encoding="utf-8")
+            return DummyProcess()
+
+        monkeypatch.setattr(generator_module, "check_node_available", lambda: True)
+        monkeypatch.setattr(generator_module.subprocess, "Popen", fake_popen)
+
+        result = uniquify_binding_names(
+            code,
+            progress_callback=progress_events.append,
+            heartbeat_interval_seconds=0.05,
+            timeout_seconds=1,
+        )
+
+        assert result == code
+        event_types = {event["event"] for event in progress_events}
+        assert "started" in event_types
+        assert "heartbeat" in event_types
+        assert "completed" in event_types
+
+    def test_uniquify_parses_js_progress_events(self, monkeypatch):
+        """JS progress payloads should be parsed and surfaced in callback."""
+        code = "function keep(alpha) { return alpha; }"
+        progress_events = []
+
+        class DummyStream:
+            def __init__(self, lines):
+                self._lines = list(lines)
+
+            def readline(self):
+                if self._lines:
+                    return self._lines.pop(0)
+                return ""
+
+        class DummyProcess:
+            def __init__(self, output_file: Path):
+                self.returncode = None
+                self._poll_count = 0
+                self.stdout = DummyStream(["Generated: ok\n"])
+                self.stderr = DummyStream([
+                    (
+                        f"{generator_module._PROGRESS_PREFIX}"
+                        f"{json.dumps({'event': 'started', 'totalBindingsToRename': 2})}\n"
+                    ),
+                    (
+                        f"{generator_module._PROGRESS_PREFIX}"
+                        f"{json.dumps({'event': 'rename_progress', 'renamedBindings': 1, 'totalBindingsToRename': 2})}\n"
+                    ),
+                    (
+                        f"{generator_module._PROGRESS_PREFIX}"
+                        f"{json.dumps({'event': 'completed', 'renamedBindings': 2, 'totalBindingsToRename': 2})}\n"
+                    ),
+                ])
+                output_file.write_text(code, encoding="utf-8")
+
+            def poll(self):
+                self._poll_count += 1
+                if self._poll_count >= 3:
+                    self.returncode = 0
+                    return 0
+                return None
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        def fake_popen(cmd, stdout=None, stderr=None, text=None, bufsize=None):
+            return DummyProcess(Path(cmd[3]))
+
+        monkeypatch.setattr(generator_module, "check_node_available", lambda: True)
+        monkeypatch.setattr(generator_module.subprocess, "Popen", fake_popen)
+
+        result = uniquify_binding_names(
+            code,
+            progress_callback=progress_events.append,
+            heartbeat_interval_seconds=5.0,
+            timeout_seconds=1,
+        )
+
+        assert result == code
+        js_progress = [
+            event
+            for event in progress_events
+            if event.get("source") == "js" and event.get("event") == "rename_progress"
+        ]
+        assert js_progress
+        assert js_progress[-1]["renamedBindings"] == 1
+        assert js_progress[-1]["totalBindingsToRename"] == 2
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="Node.js is required for Babel-based transforms")

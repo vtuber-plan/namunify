@@ -415,11 +415,102 @@ async def process_file(
         if config.enable_uniquify:
             console.print(f"[blue]Uniquifying variable names[/blue] {file_path}")
             uniquified_file = file_path.with_suffix(".uniquified.js")
+            progress_started_logged = False
+            uniquify_pbar: Optional[tqdm] = None
+            last_uniquify_renamed = 0
+
+            def ensure_uniquify_pbar(total_bindings: int) -> None:
+                nonlocal uniquify_pbar
+                if uniquify_pbar is not None or total_bindings <= 0:
+                    return
+                uniquify_pbar = tqdm(
+                    total=total_bindings,
+                    desc="Uniquifying bindings",
+                    unit="binding",
+                    ncols=100,
+                )
+
+            def on_uniquify_progress(event: dict) -> None:
+                nonlocal progress_started_logged, last_uniquify_renamed
+                event_type = event.get("event")
+                event_source = event.get("source")
+
+                if event_type == "started" and event_source == "python" and not progress_started_logged:
+                    progress_started_logged = True
+                    debug_log("info", "Binding-name uniquification started", {
+                        "file": str(file_path),
+                        "timeout_seconds": event.get("timeout_seconds"),
+                        "source_length": event.get("source_length"),
+                    })
+                    return
+
+                if event_type == "started" and event_source == "js":
+                    total = event.get("totalBindingsToRename")
+                    if isinstance(total, int):
+                        ensure_uniquify_pbar(total)
+                    debug_log("debug", "Binding-name uniquification JS started", event)
+                    return
+
+                if event_type == "heartbeat":
+                    elapsed = event.get("elapsed_seconds")
+                    timeout = event.get("timeout_seconds")
+                    if isinstance(elapsed, (int, float)) and isinstance(timeout, (int, float)):
+                        debug_log("debug", "Binding-name uniquification heartbeat", {
+                            "elapsed_seconds": elapsed,
+                            "timeout_seconds": timeout,
+                        })
+                    return
+
+                if event_type == "rename_progress":
+                    renamed = event.get("renamedBindings")
+                    total = event.get("totalBindingsToRename")
+                    if isinstance(renamed, int) and isinstance(total, int) and total > 0:
+                        ensure_uniquify_pbar(total)
+                        current = max(0, min(renamed, total))
+                        delta = current - last_uniquify_renamed
+                        if delta > 0 and uniquify_pbar is not None:
+                            uniquify_pbar.update(delta)
+                        last_uniquify_renamed = max(last_uniquify_renamed, current)
+                        debug_log("debug", "Binding-name rename progress", {
+                            "renamed_bindings": renamed,
+                            "total_bindings_to_rename": total,
+                            "processed_groups": event.get("processedGroups"),
+                            "total_duplicate_groups": event.get("totalDuplicateGroups"),
+                            "current_group_name": event.get("currentGroupName"),
+                        })
+                    return
+
+                if event_type == "completed":
+                    elapsed = event.get("elapsed_seconds")
+                    if event_source == "python":
+                        debug_log("info", "Binding-name uniquification completed", {
+                            "elapsed_seconds": elapsed,
+                            "output_path": event.get("output_path"),
+                        })
+                    else:
+                        total = event.get("totalBindingsToRename")
+                        renamed = event.get("renamedBindings")
+                        if isinstance(total, int) and total > 0:
+                            ensure_uniquify_pbar(total)
+                            current = max(0, min(renamed if isinstance(renamed, int) else total, total))
+                            delta = current - last_uniquify_renamed
+                            if delta > 0 and uniquify_pbar is not None:
+                                uniquify_pbar.update(delta)
+                            last_uniquify_renamed = max(last_uniquify_renamed, current)
+                        debug_log("debug", "Binding-name uniquification JS completed", event)
+                    return
+
+                if event_type in {"timeout", "failed", "error"}:
+                    debug_log("warning", "Binding-name uniquification status", event)
+
             uniquified_source = uniquify_binding_names(
                 source_code,
                 output_path=uniquified_file,
                 timeout_seconds=config.uniquify_timeout_seconds,
+                progress_callback=on_uniquify_progress,
             )
+            if uniquify_pbar is not None:
+                uniquify_pbar.close()
             if uniquified_source != source_code:
                 debug_log("info", f"Applied binding-name uniquification: {uniquified_file}")
                 source_code = uniquified_source
@@ -990,7 +1081,7 @@ def main():
 @click.option("--no-prettier", is_flag=True, help="Disable prettier formatting")
 @click.option("--no-uniquify", is_flag=True, help="Disable binding-name uniquification step")
 @click.option("--no-program-batch", is_flag=True, help="Disable program-scope batching and force single-symbol top-level calls")
-@click.option("--uniquify-timeout", default=300, help="Uniquification timeout in seconds")
+@click.option("--uniquify-timeout", default=300, help="Stall timeout without JS progress (seconds)")
 @click.option("--unpack", is_flag=True, help="Unpack webpack bundle first")
 @click.option("--install-webcrack", is_flag=True, help="Install webcrack if needed")
 @click.option("--debug", is_flag=True, help="Enable debug logging to file")

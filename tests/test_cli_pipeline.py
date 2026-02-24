@@ -18,7 +18,13 @@ async def test_process_file_uniquify_before_beautify(monkeypatch, tmp_path):
     call_order: list[str] = []
     observed: dict[str, object] = {}
 
-    def fake_uniquify(source_code: str, output_path=None, timeout_seconds: int = 300) -> str:
+    def fake_uniquify(
+        source_code: str,
+        output_path=None,
+        timeout_seconds: int = 300,
+        progress_callback=None,
+        heartbeat_interval_seconds: float = 2.0,
+    ) -> str:
         call_order.append("uniquify")
         observed["source_before_uniquify"] = source_code
 

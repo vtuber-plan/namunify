@@ -64,7 +64,10 @@ class Config(BaseSettings):
     )
     context_padding: int = Field(default=200, description="Lines of context around symbol (legacy, use max_context_lines)")
     enable_uniquify: bool = Field(default=True, description="Apply binding-name uniquification before analysis")
-    uniquify_timeout_seconds: int = Field(default=300, description="Timeout for binding-name uniquification")
+    uniquify_timeout_seconds: int = Field(
+        default=300,
+        description="Stall timeout without JS progress events during binding-name uniquification",
+    )
 
     # Output Settings
     output_dir: Optional[Path] = Field(default=None, description="Output directory for deobfuscated files")

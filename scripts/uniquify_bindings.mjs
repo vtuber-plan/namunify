@@ -66,6 +66,19 @@ try {
 const seenBindings = new Set();
 const groups = new Map();
 const usedNames = new Set();
+const PROGRESS_PREFIX = '__NAMUNIFY_PROGRESS__';
+
+function emitProgress(event, data = {}) {
+  const payload = {
+    event,
+    ...data,
+  };
+  try {
+    process.stderr.write(`${PROGRESS_PREFIX}${JSON.stringify(payload)}\n`);
+  } catch (_err) {
+    // Best-effort progress reporting only.
+  }
+}
 
 function bindingKey(binding, name) {
   if (!binding?.identifier) {
@@ -131,20 +144,62 @@ traverse.default(ast, {
   },
 });
 
+const duplicateGroups = [];
+let totalBindingsToRename = 0;
 for (const [name, bindings] of groups.entries()) {
   if (bindings.length <= 1) {
     continue;
   }
+  duplicateGroups.push([name, bindings]);
+  totalBindingsToRename += bindings.length;
+}
 
+const startedAt = Date.now();
+emitProgress('started', {
+  totalDuplicateGroups: duplicateGroups.length,
+  totalBindingsToRename,
+});
+
+let renamedBindings = 0;
+let processedGroups = 0;
+let lastProgressEmitAt = 0;
+
+for (const [name, bindings] of duplicateGroups) {
   bindings.sort((a, b) => getBindingStart(a) - getBindingStart(b));
 
   let index = 1;
   for (const binding of bindings) {
     const uniqueName = makeUniqueName(name, index);
     binding.scope.rename(name, uniqueName);
+    renamedBindings += 1;
+
+    const now = Date.now();
+    if (
+      renamedBindings === 1 ||
+      renamedBindings === totalBindingsToRename ||
+      now - lastProgressEmitAt >= 200
+    ) {
+      lastProgressEmitAt = now;
+      emitProgress('rename_progress', {
+        renamedBindings,
+        totalBindingsToRename,
+        processedGroups,
+        totalDuplicateGroups: duplicateGroups.length,
+        currentGroupName: name,
+      });
+    }
     index += 1;
   }
+  processedGroups += 1;
 }
+
+emitProgress('completed', {
+  renamedBindings,
+  totalBindingsToRename,
+  processedGroups,
+  totalDuplicateGroups: duplicateGroups.length,
+  elapsedMilliseconds: Date.now() - startedAt,
+});
 
 const output = generate.default(ast, {
   comments: true,
