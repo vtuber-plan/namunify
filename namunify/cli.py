@@ -1,6 +1,7 @@
 """CLI interface for namunify."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -31,6 +32,7 @@ debug_log_file = None
 
 # State manager (global for process_file access)
 state_manager = StateManager()
+_PREPROCESS_CACHE_KEY = "__preprocess_cache__"
 
 
 def setup_debug_logger(log_path: Optional[Path] = None) -> logging.Logger:
@@ -217,6 +219,29 @@ def _count_binding_names(parse_result) -> dict[str, int]:
     for binding in parse_result.all_bindings:
         counts[binding.name] = counts.get(binding.name, 0) + 1
     return counts
+
+
+def _compute_sha256(text: str) -> str:
+    """Compute SHA-256 hex digest for a text payload."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _extract_preprocess_cache(state: Optional[ProcessingState]) -> dict:
+    """Read preprocess cache payload from processing state."""
+    if state is None or not isinstance(state.config, dict):
+        return {}
+    cache = state.config.get(_PREPROCESS_CACHE_KEY)
+    return cache if isinstance(cache, dict) else {}
+
+
+def _existing_path(path_text: Optional[str]) -> Optional[Path]:
+    """Return path only when text is valid and file exists."""
+    if not path_text or not isinstance(path_text, str):
+        return None
+    path = Path(path_text)
+    if not path.exists() or not path.is_file():
+        return None
+    return path
 
 
 def _normalize_rename_keys_for_unique_bindings(
@@ -409,122 +434,232 @@ async def process_file(
     try:
         # Read original source code first
         source_code = file_path.read_text(encoding="utf-8")
+        source_code_hash = _compute_sha256(source_code)
         preprocess_input_file = file_path
+        beautified_file = file_path
+        resumed_from_checkpoint = False
+
+        # Check for existing checkpoint state before expensive preprocessing
+        if resume and state_manager.has_state(file_path):
+            processing_state = state_manager.load_state(file_path)
+            if processing_state and ask_resume(processing_state, state_manager):
+                resumed_from_checkpoint = True
+                start_scope_idx = processing_state.processed_scopes
+                debug_log("info", "Resume checkpoint accepted", {
+                    "start_scope_idx": start_scope_idx,
+                    "processed_scopes": processing_state.processed_scopes,
+                    "total_scopes": processing_state.total_scopes,
+                })
+            else:
+                # User chose not to resume, start fresh
+                state_manager.clear_state(file_path)
+                processing_state = None
+
+        preprocess_cache = _extract_preprocess_cache(processing_state)
+        if resumed_from_checkpoint and preprocess_cache:
+            saved_hash = preprocess_cache.get("source_sha256")
+            if isinstance(saved_hash, str) and saved_hash and saved_hash != source_code_hash:
+                console.print("[yellow]Input changed since checkpoint; starting fresh (state cleared).[/yellow]")
+                state_manager.clear_state(file_path)
+                processing_state = None
+                resumed_from_checkpoint = False
+                start_scope_idx = 0
+                preprocess_cache = {}
+            saved_enable_uniquify = preprocess_cache.get("enable_uniquify")
+            if (
+                resumed_from_checkpoint
+                and isinstance(saved_enable_uniquify, bool)
+                and saved_enable_uniquify != config.enable_uniquify
+            ):
+                console.print(
+                    "[yellow]Uniquify setting changed since checkpoint; starting fresh (state cleared).[/yellow]"
+                )
+                state_manager.clear_state(file_path)
+                processing_state = None
+                resumed_from_checkpoint = False
+                start_scope_idx = 0
+                preprocess_cache = {}
+
+        cache_matches_input = (
+            bool(preprocess_cache)
+            and preprocess_cache.get("source_sha256") == source_code_hash
+            and preprocess_cache.get("enable_uniquify") == config.enable_uniquify
+        )
+        cached_uniquified_file = (
+            _existing_path(preprocess_cache.get("uniquified_file"))
+            if cache_matches_input else None
+        )
+        cached_beautified_file = (
+            _existing_path(preprocess_cache.get("beautified_file"))
+            if cache_matches_input else None
+        )
+        uniquified_file_used: Optional[Path] = None
+        used_cached_final_preprocess = False
+
+        if cached_beautified_file is not None:
+            if config.enable_uniquify:
+                console.print(f"[blue]Uniquifying variable names[/blue] {file_path} [dim](cached)[/dim]")
+                if cached_uniquified_file is not None:
+                    preprocess_input_file = cached_uniquified_file
+                    uniquified_file_used = cached_uniquified_file
+            console.print(f"[blue]Beautifying[/blue] {preprocess_input_file} [dim](cached)[/dim]")
+            beautified_file = cached_beautified_file
+            source_code = cached_beautified_file.read_text(encoding="utf-8")
+            used_cached_final_preprocess = True
+            debug_log("info", "Using cached preprocess artifacts", {
+                "uniquified_file": str(cached_uniquified_file) if cached_uniquified_file else None,
+                "beautified_file": str(cached_beautified_file),
+            })
 
         # Ensure variable bindings with the same name in different scopes are unique
-        if config.enable_uniquify:
-            console.print(f"[blue]Uniquifying variable names[/blue] {file_path}")
-            uniquified_file = file_path.with_suffix(".uniquified.js")
-            progress_started_logged = False
-            uniquify_pbar: Optional[tqdm] = None
-            last_uniquify_renamed = 0
+        if not used_cached_final_preprocess and config.enable_uniquify:
+            if cached_uniquified_file is not None:
+                console.print(f"[blue]Uniquifying variable names[/blue] {file_path} [dim](cached)[/dim]")
+                preprocess_input_file = cached_uniquified_file
+                uniquified_file_used = cached_uniquified_file
+                source_code = cached_uniquified_file.read_text(encoding="utf-8")
+                debug_log("info", "Using cached uniquified source", {
+                    "cached_file": str(cached_uniquified_file),
+                })
+            else:
+                console.print(f"[blue]Uniquifying variable names[/blue] {file_path}")
+                uniquified_file = file_path.with_suffix(".uniquified.js")
+                progress_started_logged = False
+                uniquify_pbar: Optional[tqdm] = None
+                last_uniquify_renamed = 0
 
-            def ensure_uniquify_pbar(total_bindings: int) -> None:
-                nonlocal uniquify_pbar
-                if uniquify_pbar is not None or total_bindings <= 0:
-                    return
-                uniquify_pbar = tqdm(
-                    total=total_bindings,
-                    desc="Uniquifying bindings",
-                    unit="binding",
-                    ncols=100,
-                )
+                def ensure_uniquify_pbar(total_bindings: int) -> None:
+                    nonlocal uniquify_pbar
+                    if uniquify_pbar is not None or total_bindings <= 0:
+                        return
+                    uniquify_pbar = tqdm(
+                        total=total_bindings,
+                        desc="Uniquifying bindings",
+                        unit="binding",
+                        ncols=100,
+                    )
 
-            def on_uniquify_progress(event: dict) -> None:
-                nonlocal progress_started_logged, last_uniquify_renamed
-                event_type = event.get("event")
-                event_source = event.get("source")
+                def on_uniquify_progress(event: dict) -> None:
+                    nonlocal progress_started_logged, last_uniquify_renamed
+                    event_type = event.get("event")
+                    event_source = event.get("source")
 
-                if event_type == "started" and event_source == "python" and not progress_started_logged:
-                    progress_started_logged = True
-                    debug_log("info", "Binding-name uniquification started", {
-                        "file": str(file_path),
-                        "timeout_seconds": event.get("timeout_seconds"),
-                        "source_length": event.get("source_length"),
-                    })
-                    return
-
-                if event_type == "started" and event_source == "js":
-                    total = event.get("totalBindingsToRename")
-                    if isinstance(total, int):
-                        ensure_uniquify_pbar(total)
-                    debug_log("debug", "Binding-name uniquification JS started", event)
-                    return
-
-                if event_type == "heartbeat":
-                    elapsed = event.get("elapsed_seconds")
-                    timeout = event.get("timeout_seconds")
-                    if isinstance(elapsed, (int, float)) and isinstance(timeout, (int, float)):
-                        debug_log("debug", "Binding-name uniquification heartbeat", {
-                            "elapsed_seconds": elapsed,
-                            "timeout_seconds": timeout,
+                    if event_type == "started" and event_source == "python" and not progress_started_logged:
+                        progress_started_logged = True
+                        debug_log("info", "Binding-name uniquification started", {
+                            "file": str(file_path),
+                            "timeout_seconds": event.get("timeout_seconds"),
+                            "source_length": event.get("source_length"),
                         })
-                    return
+                        return
 
-                if event_type == "rename_progress":
-                    renamed = event.get("renamedBindings")
-                    total = event.get("totalBindingsToRename")
-                    if isinstance(renamed, int) and isinstance(total, int) and total > 0:
-                        ensure_uniquify_pbar(total)
-                        current = max(0, min(renamed, total))
-                        delta = current - last_uniquify_renamed
-                        if delta > 0 and uniquify_pbar is not None:
-                            uniquify_pbar.update(delta)
-                        last_uniquify_renamed = max(last_uniquify_renamed, current)
-                        debug_log("debug", "Binding-name rename progress", {
-                            "renamed_bindings": renamed,
-                            "total_bindings_to_rename": total,
-                            "processed_groups": event.get("processedGroups"),
-                            "total_duplicate_groups": event.get("totalDuplicateGroups"),
-                            "current_group_name": event.get("currentGroupName"),
-                        })
-                    return
-
-                if event_type == "completed":
-                    elapsed = event.get("elapsed_seconds")
-                    if event_source == "python":
-                        debug_log("info", "Binding-name uniquification completed", {
-                            "elapsed_seconds": elapsed,
-                            "output_path": event.get("output_path"),
-                        })
-                    else:
+                    if event_type == "started" and event_source == "js":
                         total = event.get("totalBindingsToRename")
-                        renamed = event.get("renamedBindings")
-                        if isinstance(total, int) and total > 0:
+                        if isinstance(total, int):
                             ensure_uniquify_pbar(total)
-                            current = max(0, min(renamed if isinstance(renamed, int) else total, total))
+                        debug_log("debug", "Binding-name uniquification JS started", event)
+                        return
+
+                    if event_type == "heartbeat":
+                        elapsed = event.get("elapsed_seconds")
+                        timeout = event.get("timeout_seconds")
+                        if isinstance(elapsed, (int, float)) and isinstance(timeout, (int, float)):
+                            debug_log("debug", "Binding-name uniquification heartbeat", {
+                                "elapsed_seconds": elapsed,
+                                "timeout_seconds": timeout,
+                            })
+                        return
+
+                    if event_type == "rename_progress":
+                        renamed = event.get("renamedBindings")
+                        total = event.get("totalBindingsToRename")
+                        if isinstance(renamed, int) and isinstance(total, int) and total > 0:
+                            ensure_uniquify_pbar(total)
+                            current = max(0, min(renamed, total))
                             delta = current - last_uniquify_renamed
                             if delta > 0 and uniquify_pbar is not None:
                                 uniquify_pbar.update(delta)
                             last_uniquify_renamed = max(last_uniquify_renamed, current)
-                        debug_log("debug", "Binding-name uniquification JS completed", event)
-                    return
+                            debug_log("debug", "Binding-name rename progress", {
+                                "renamed_bindings": renamed,
+                                "total_bindings_to_rename": total,
+                                "processed_groups": event.get("processedGroups"),
+                                "total_duplicate_groups": event.get("totalDuplicateGroups"),
+                                "current_group_name": event.get("currentGroupName"),
+                            })
+                        return
 
-                if event_type in {"timeout", "failed", "error"}:
-                    debug_log("warning", "Binding-name uniquification status", event)
+                    if event_type == "completed":
+                        elapsed = event.get("elapsed_seconds")
+                        if event_source == "python":
+                            debug_log("info", "Binding-name uniquification completed", {
+                                "elapsed_seconds": elapsed,
+                                "output_path": event.get("output_path"),
+                            })
+                        else:
+                            total = event.get("totalBindingsToRename")
+                            renamed = event.get("renamedBindings")
+                            if isinstance(total, int) and total > 0:
+                                ensure_uniquify_pbar(total)
+                                current = max(0, min(renamed if isinstance(renamed, int) else total, total))
+                                delta = current - last_uniquify_renamed
+                                if delta > 0 and uniquify_pbar is not None:
+                                    uniquify_pbar.update(delta)
+                                last_uniquify_renamed = max(last_uniquify_renamed, current)
+                            debug_log("debug", "Binding-name uniquification JS completed", event)
+                        return
 
-            uniquified_source = uniquify_binding_names(
-                source_code,
-                output_path=uniquified_file,
-                timeout_seconds=config.uniquify_timeout_seconds,
-                progress_callback=on_uniquify_progress,
-            )
-            if uniquify_pbar is not None:
-                uniquify_pbar.close()
-            if uniquified_source != source_code:
-                debug_log("info", f"Applied binding-name uniquification: {uniquified_file}")
-                source_code = uniquified_source
-            else:
-                debug_log("info", f"Binding-name uniquification produced no changes: {uniquified_file}")
-            if uniquified_file.exists():
-                preprocess_input_file = uniquified_file
-        else:
+                    if event_type in {"timeout", "failed", "error"}:
+                        debug_log("warning", "Binding-name uniquification status", event)
+
+                uniquified_source = uniquify_binding_names(
+                    source_code,
+                    output_path=uniquified_file,
+                    timeout_seconds=config.uniquify_timeout_seconds,
+                    progress_callback=on_uniquify_progress,
+                )
+                if uniquify_pbar is not None:
+                    uniquify_pbar.close()
+                if uniquified_source != source_code:
+                    debug_log("info", f"Applied binding-name uniquification: {uniquified_file}")
+                    source_code = uniquified_source
+                else:
+                    debug_log("info", f"Binding-name uniquification produced no changes: {uniquified_file}")
+                if uniquified_file.exists():
+                    preprocess_input_file = uniquified_file
+                    uniquified_file_used = uniquified_file
+        elif not used_cached_final_preprocess:
             debug_log("info", "Binding-name uniquification disabled by configuration")
 
         # Beautify after uniquification so formatting reflects final identifier names
-        console.print(f"[blue]Beautifying[/blue] {preprocess_input_file}")
-        beautified_file = beautify_js_file(preprocess_input_file)
-        debug_log("info", f"Beautified file: {beautified_file}")
+        if used_cached_final_preprocess:
+            debug_log("info", f"Beautified file: {beautified_file}")
+        elif cached_beautified_file is not None:
+            console.print(f"[blue]Beautifying[/blue] {preprocess_input_file} [dim](cached)[/dim]")
+            beautified_file = cached_beautified_file
+            debug_log("info", "Using cached beautified source", {
+                "cached_file": str(cached_beautified_file),
+            })
+        else:
+            console.print(f"[blue]Beautifying[/blue] {preprocess_input_file}")
+            beautified_file = beautify_js_file(preprocess_input_file)
+            debug_log("info", f"Beautified file: {beautified_file}")
+
+        preprocess_cache_payload = {
+            "source_sha256": source_code_hash,
+            "enable_uniquify": config.enable_uniquify,
+            "uniquified_file": (
+                str(uniquified_file_used.resolve())
+                if uniquified_file_used is not None and uniquified_file_used.exists()
+                else ""
+            ),
+            "beautified_file": str(beautified_file.resolve()) if beautified_file.exists() else "",
+        }
+
+        if processing_state is not None and isinstance(processing_state.config, dict):
+            processing_state.config[_PREPROCESS_CACHE_KEY] = preprocess_cache_payload
+            state_manager.save_state(processing_state)
+            debug_log("debug", "Updated checkpoint preprocess cache", preprocess_cache_payload)
 
         # Read source code (from beautified file if available)
         source_code = beautified_file.read_text(encoding="utf-8")
@@ -581,28 +716,20 @@ async def process_file(
             console.print("[yellow]No obfuscated symbols found[/yellow]")
             return stats
 
-        # Check for existing checkpoint state
-        if resume and state_manager.has_state(file_path):
-            processing_state = state_manager.load_state(file_path)
-            if processing_state and ask_resume(processing_state, state_manager):
-                start_scope_idx = processing_state.processed_scopes
-                # Apply already processed renames
-                normalized_saved_renames = _normalize_rename_keys_for_unique_bindings(
-                    processing_state.all_renames,
-                    initial_binding_name_counts,
-                )
-                generator.apply_renames(normalized_saved_renames)
-                processing_state.all_renames = normalized_saved_renames
-                stats["symbols_renamed"] = len(normalized_saved_renames)
-                console.print(f"[green]Resuming from scope {start_scope_idx + 1}[/green]")
-                debug_log("info", f"Resuming from checkpoint", {
-                    "start_scope_idx": start_scope_idx,
-                    "already_renamed_count": len(normalized_saved_renames),
-                })
-            else:
-                # User chose not to resume, start fresh
-                state_manager.clear_state(file_path)
-                processing_state = None
+        if resumed_from_checkpoint and processing_state is not None:
+            # Apply already processed renames
+            normalized_saved_renames = _normalize_rename_keys_for_unique_bindings(
+                processing_state.all_renames,
+                initial_binding_name_counts,
+            )
+            generator.apply_renames(normalized_saved_renames)
+            processing_state.all_renames = normalized_saved_renames
+            stats["symbols_renamed"] = len(normalized_saved_renames)
+            console.print(f"[green]Resuming from scope {start_scope_idx + 1}[/green]")
+            debug_log("info", "Resuming from checkpoint", {
+                "start_scope_idx": start_scope_idx,
+                "already_renamed_count": len(normalized_saved_renames),
+            })
 
         # Create or get processing state
         if processing_state is None:
@@ -618,6 +745,7 @@ async def process_file(
                 "program_function_max_chars": config.program_function_max_chars,
                 "program_function_max_lines": config.program_function_max_lines,
                 "context_padding": config.context_padding,
+                _PREPROCESS_CACHE_KEY: preprocess_cache_payload,
             }
             processing_state = state_manager.create_state(
                 input_file=file_path,
