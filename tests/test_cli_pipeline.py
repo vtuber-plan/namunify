@@ -49,7 +49,9 @@ async def test_process_file_uniquify_before_beautify(monkeypatch, tmp_path):
 
     assert call_order == ["uniquify", "beautify"]
     assert observed["source_before_uniquify"] == original_code
-    assert observed["beautify_input"] == input_file.with_suffix(".uniquified.js")
+    beautify_input = observed["beautify_input"]
+    assert beautify_input.name.endswith(".uniquified.js")
+    assert cli._PREPROCESS_CACHE_SUBDIR in str(beautify_input)
     assert stats["symbols_found"] == 0
     assert stats["symbols_renamed"] == 0
 

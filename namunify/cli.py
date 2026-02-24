@@ -33,6 +33,7 @@ debug_log_file = None
 # State manager (global for process_file access)
 state_manager = StateManager()
 _PREPROCESS_CACHE_KEY = "__preprocess_cache__"
+_PREPROCESS_CACHE_SUBDIR = "preprocess"
 
 
 def setup_debug_logger(log_path: Optional[Path] = None) -> logging.Logger:
@@ -242,6 +243,28 @@ def _existing_path(path_text: Optional[str]) -> Optional[Path]:
     if not path.exists() or not path.is_file():
         return None
     return path
+
+
+def _build_preprocess_cache_paths(
+    input_file: Path,
+    source_sha256: str,
+    enable_uniquify: bool,
+) -> tuple[Path, Path]:
+    """Build deterministic preprocess cache paths under state directory."""
+    path_hash = hashlib.md5(str(input_file.resolve()).encode()).hexdigest()[:12]
+    source_hash_short = source_sha256[:16]
+    mode_tag = "uniq" if enable_uniquify else "raw"
+
+    cache_dir = (
+        state_manager.state_dir
+        / _PREPROCESS_CACHE_SUBDIR
+        / f"{input_file.stem}_{path_hash}_{source_hash_short}_{mode_tag}"
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    uniquified_file = cache_dir / f"{input_file.stem}.uniquified.js"
+    beautified_file = cache_dir / f"{input_file.stem}.beautified.js"
+    return uniquified_file, beautified_file
 
 
 def _normalize_rename_keys_for_unique_bindings(
@@ -480,6 +503,11 @@ async def process_file(
                 start_scope_idx = 0
                 preprocess_cache = {}
 
+        cache_uniquified_target, cache_beautified_target = _build_preprocess_cache_paths(
+            file_path,
+            source_code_hash,
+            config.enable_uniquify,
+        )
         cache_matches_input = (
             bool(preprocess_cache)
             and preprocess_cache.get("source_sha256") == source_code_hash
@@ -493,6 +521,10 @@ async def process_file(
             _existing_path(preprocess_cache.get("beautified_file"))
             if cache_matches_input else None
         )
+        if cached_uniquified_file is None:
+            cached_uniquified_file = _existing_path(str(cache_uniquified_target))
+        if cached_beautified_file is None:
+            cached_beautified_file = _existing_path(str(cache_beautified_target))
         uniquified_file_used: Optional[Path] = None
         used_cached_final_preprocess = False
 
@@ -523,7 +555,7 @@ async def process_file(
                 })
             else:
                 console.print(f"[blue]Uniquifying variable names[/blue] {file_path}")
-                uniquified_file = file_path.with_suffix(".uniquified.js")
+                uniquified_file = cache_uniquified_target
                 progress_started_logged = False
                 uniquify_pbar: Optional[tqdm] = None
                 last_uniquify_renamed = 0
@@ -642,7 +674,7 @@ async def process_file(
             })
         else:
             console.print(f"[blue]Beautifying[/blue] {preprocess_input_file}")
-            beautified_file = beautify_js_file(preprocess_input_file)
+            beautified_file = beautify_js_file(preprocess_input_file, output_file=cache_beautified_target)
             debug_log("info", f"Beautified file: {beautified_file}")
 
         preprocess_cache_payload = {
