@@ -725,6 +725,9 @@ async def process_file(
             program_variable_max_assignment_lines=config.program_variable_max_assignment_lines,
             program_function_max_chars=config.program_function_max_chars,
             program_function_max_lines=config.program_function_max_lines,
+            local_scope_merge_enabled=config.local_scope_merge_enabled,
+            local_scope_merge_function_max_chars=config.local_scope_merge_function_max_chars,
+            local_scope_merge_function_max_lines=config.local_scope_merge_function_max_lines,
         )
 
         total_symbols = sum(len(s.identifiers) for s in scope_infos)
@@ -780,6 +783,9 @@ async def process_file(
                 "program_variable_max_assignment_lines": config.program_variable_max_assignment_lines,
                 "program_function_max_chars": config.program_function_max_chars,
                 "program_function_max_lines": config.program_function_max_lines,
+                "local_scope_merge_enabled": config.local_scope_merge_enabled,
+                "local_scope_merge_function_max_chars": config.local_scope_merge_function_max_chars,
+                "local_scope_merge_function_max_lines": config.local_scope_merge_function_max_lines,
                 "context_padding": config.context_padding,
                 _PREPROCESS_CACHE_KEY: preprocess_cache_payload,
             }
@@ -835,6 +841,9 @@ async def process_file(
                 program_variable_max_assignment_lines=config.program_variable_max_assignment_lines,
                 program_function_max_chars=config.program_function_max_chars,
                 program_function_max_lines=config.program_function_max_lines,
+                local_scope_merge_enabled=config.local_scope_merge_enabled,
+                local_scope_merge_function_max_chars=config.local_scope_merge_function_max_chars,
+                local_scope_merge_function_max_lines=config.local_scope_merge_function_max_lines,
             )
 
             # Find the first scope with remaining symbols to rename
@@ -1241,10 +1250,21 @@ def main():
     default=20,
     help="Max lines for top-level function declaration to allow batching",
 )
+@click.option(
+    "--local-fn-merge-max-chars",
+    default=1200,
+    help="Max chars for a function to allow local block/catch merge",
+)
+@click.option(
+    "--local-fn-merge-max-lines",
+    default=40,
+    help="Max lines for a function to allow local block/catch merge",
+)
 @click.option("--context-padding", default=500, help="Lines of context around symbols")
 @click.option("--no-prettier", is_flag=True, help="Disable prettier formatting")
 @click.option("--no-uniquify", is_flag=True, help="Disable binding-name uniquification step")
 @click.option("--no-program-batch", is_flag=True, help="Disable program-scope batching and force single-symbol top-level calls")
+@click.option("--no-local-scope-merge", is_flag=True, help="Disable small-function local block/catch scope merge")
 @click.option("--uniquify-timeout", default=300, help="Stall timeout without JS progress (seconds)")
 @click.option("--unpack", is_flag=True, help="Unpack webpack bundle first")
 @click.option("--install-webcrack", is_flag=True, help="Install webcrack if needed")
@@ -1265,10 +1285,13 @@ def deobfuscate(
     program_var_max_lines: int,
     program_fn_max_chars: int,
     program_fn_max_lines: int,
+    local_fn_merge_max_chars: int,
+    local_fn_merge_max_lines: int,
     context_padding: int,
     no_prettier: bool,
     no_uniquify: bool,
     no_program_batch: bool,
+    no_local_scope_merge: bool,
     uniquify_timeout: int,
     unpack: bool,
     install_webcrack: bool,
@@ -1300,6 +1323,9 @@ def deobfuscate(
             "program_var_max_lines": program_var_max_lines,
             "program_fn_max_chars": program_fn_max_chars,
             "program_fn_max_lines": program_fn_max_lines,
+            "local_scope_merge_enabled": not no_local_scope_merge,
+            "local_fn_merge_max_chars": local_fn_merge_max_chars,
+            "local_fn_merge_max_lines": local_fn_merge_max_lines,
             "program_batching_enabled": not no_program_batch,
             "debug_scope_details": debug_scope_details,
             "context_padding": context_padding,
@@ -1318,6 +1344,9 @@ def deobfuscate(
         "program_variable_max_assignment_lines": program_var_max_lines,
         "program_function_max_chars": program_fn_max_chars,
         "program_function_max_lines": program_fn_max_lines,
+        "local_scope_merge_enabled": not no_local_scope_merge,
+        "local_scope_merge_function_max_chars": local_fn_merge_max_chars,
+        "local_scope_merge_function_max_lines": local_fn_merge_max_lines,
         "debug_scope_details": debug_scope_details,
         "context_padding": context_padding,
         "prettier_format": not no_prettier,
@@ -1346,6 +1375,9 @@ def deobfuscate(
         "program_variable_max_assignment_lines": config.program_variable_max_assignment_lines,
         "program_function_max_chars": config.program_function_max_chars,
         "program_function_max_lines": config.program_function_max_lines,
+        "local_scope_merge_enabled": config.local_scope_merge_enabled,
+        "local_scope_merge_function_max_chars": config.local_scope_merge_function_max_chars,
+        "local_scope_merge_function_max_lines": config.local_scope_merge_function_max_lines,
         "debug_scope_details": config.debug_scope_details,
         "context_padding": config.context_padding,
         "prettier_format": config.prettier_format,

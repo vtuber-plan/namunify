@@ -211,7 +211,7 @@ function f(e__u9, t__u8) {
 }
 """
         result = parse_javascript(code)
-        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50, local_scope_merge_enabled=False)
 
         block_scopes = [s for s in scopes if s.scope_type == "block"]
         assert block_scopes
@@ -221,7 +221,7 @@ function f(e__u9, t__u8) {
         )
 
     def test_block_scope_not_merged_into_function(self):
-        """Nested block scope identifiers should remain in block scope."""
+        """Nested block scope identifiers can stay in block scope when merge is disabled."""
         code = """
 function f() {
     for (var a = 0; a < 1; a++) {
@@ -230,7 +230,7 @@ function f() {
 }
 """
         result = parse_javascript(code)
-        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50, local_scope_merge_enabled=False)
 
         block_scopes = [s for s in scopes if s.scope_type == "block"]
 
@@ -240,6 +240,30 @@ function f() {
             all(identifier.name != "b" for identifier in s.identifiers)
             for s in scopes
             if s.scope_type != "block"
+        )
+
+    def test_small_function_merges_local_block_and_catch_scopes(self):
+        """Small functions should merge local block/catch symbols into one batch."""
+        code = """
+function g__u1(a__u2) {
+    try {
+        const c__u4 = a__u2 + 1;
+        return c__u4;
+    } catch (e__u3) {
+        let d__u5 = e__u3;
+        return d__u5;
+    }
+}
+"""
+        result = parse_javascript(code)
+        scopes = analyze_identifiers(result, max_symbols_per_scope=50)
+
+        merged_function_scopes = [s for s in scopes if s.scope_type in {"function", "arrow", "method"}]
+        assert merged_function_scopes
+
+        assert any(
+            {"a__u2", "c__u4", "e__u3", "d__u5"}.issubset({identifier.name for identifier in scope.identifiers})
+            for scope in merged_function_scopes
         )
 
     def test_scopes_are_sorted_from_small_to_large(self):

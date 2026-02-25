@@ -58,6 +58,18 @@ class Config(BaseSettings):
         default=20,
         description="Max lines for top-level function declaration to be batch-eligible",
     )
+    local_scope_merge_enabled: bool = Field(
+        default=True,
+        description="Merge small function-local block/catch scopes into one batch",
+    )
+    local_scope_merge_function_max_chars: int = Field(
+        default=1200,
+        description="Max chars for a function to allow local block/catch scope merge",
+    )
+    local_scope_merge_function_max_lines: int = Field(
+        default=40,
+        description="Max lines for a function to allow local block/catch scope merge",
+    )
     debug_scope_details: bool = Field(
         default=False,
         description="Include full scope details in debug logs (very verbose)",

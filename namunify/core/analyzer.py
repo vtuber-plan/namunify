@@ -119,6 +119,9 @@ def analyze_identifiers(
     program_variable_max_assignment_lines: int = 2,
     program_function_max_chars: int = 600,
     program_function_max_lines: int = 20,
+    local_scope_merge_enabled: bool = True,
+    local_scope_merge_function_max_chars: int = 1200,
+    local_scope_merge_function_max_lines: int = 40,
 ) -> list[ScopeInfo]:
     """Analyze and group identifiers for renaming.
 
@@ -138,6 +141,9 @@ def analyze_identifiers(
         program_variable_max_assignment_lines: Max lines for top-level var/let/const assignment
         program_function_max_chars: Max chars for top-level function declaration
         program_function_max_lines: Max lines for top-level function declaration
+        local_scope_merge_enabled: Whether to merge small function-local block/catch scopes
+        local_scope_merge_function_max_chars: Max chars for small function-local merge candidate
+        local_scope_merge_function_max_lines: Max lines for small function-local merge candidate
 
     Returns:
         List of ScopeInfo objects ready for LLM processing
@@ -179,6 +185,16 @@ def analyze_identifiers(
             child_scope_ids=scope.children.copy(),
         )
         scope_infos[scope_id] = scope_info
+
+    if local_scope_merge_enabled:
+        _merge_small_function_local_scopes(
+            scope_infos=scope_infos,
+            scopes=scopes,
+            lines=lines,
+            max_symbols_per_scope=max_symbols_per_scope,
+            function_max_chars=local_scope_merge_function_max_chars,
+            function_max_lines=local_scope_merge_function_max_lines,
+        )
 
     # Prepare context for each scope
     for scope_info in scope_infos.values():
@@ -235,6 +251,118 @@ def _can_batch_in_scope(scope_type: str) -> bool:
     We only forbid batching at global program scope.
     """
     return scope_type != "program"
+
+
+def _merge_small_function_local_scopes(
+    scope_infos: dict[str, ScopeInfo],
+    scopes: dict,
+    lines: list[str],
+    max_symbols_per_scope: int,
+    function_max_chars: int,
+    function_max_lines: int,
+) -> None:
+    """Merge small function-local block/catch identifiers into one batch.
+
+    This keeps related local names (including catch variables) in a single LLM call,
+    while avoiding cross-function merges.
+    """
+    function_scope_types = {"function", "arrow", "method"}
+    boundary_scope_types = function_scope_types | {"class"}
+
+    for function_scope in scopes.values():
+        if function_scope.scope_type not in function_scope_types:
+            continue
+        if not _is_small_scope_range(function_scope.range, lines, function_max_chars, function_max_lines):
+            continue
+
+        collected_scope_ids: list[str] = []
+        if function_scope.scope_id in scope_infos and not scope_infos[function_scope.scope_id].merged:
+            collected_scope_ids.append(function_scope.scope_id)
+
+        pending = list(function_scope.children)
+        while pending:
+            child_scope_id = pending.pop(0)
+            child_scope = scopes.get(child_scope_id)
+            if child_scope is None:
+                continue
+            if child_scope.scope_type in boundary_scope_types:
+                # Do not merge across nested function/class boundaries.
+                continue
+
+            if child_scope_id in scope_infos and not scope_infos[child_scope_id].merged:
+                collected_scope_ids.append(child_scope_id)
+            pending.extend(child_scope.children)
+
+        if not collected_scope_ids:
+            continue
+
+        merged_identifiers = _collect_sorted_unique_identifiers(scope_infos, collected_scope_ids)
+        if len(merged_identifiers) <= 1:
+            continue
+        if len(merged_identifiers) > max_symbols_per_scope:
+            continue
+
+        # Keep this merge conservative when same symbol names still exist.
+        unique_names = {identifier.name for identifier in merged_identifiers}
+        if len(unique_names) != len(merged_identifiers):
+            continue
+
+        merged_scope_id = f"{function_scope.scope_id}_local_merge"
+        dedupe_index = 1
+        while merged_scope_id in scope_infos:
+            merged_scope_id = f"{function_scope.scope_id}_local_merge_{dedupe_index}"
+            dedupe_index += 1
+
+        for scope_id in collected_scope_ids:
+            if scope_id in scope_infos:
+                scope_infos[scope_id].merged = True
+
+        scope_infos[merged_scope_id] = ScopeInfo(
+            scope_id=merged_scope_id,
+            scope_type=function_scope.scope_type,
+            range=function_scope.range,
+            identifiers=merged_identifiers,
+            parent_scope_id=function_scope.parent_id,
+            child_scope_ids=function_scope.children.copy(),
+        )
+
+
+def _is_small_scope_range(scope_range: Range, lines: list[str], max_chars: int, max_lines: int) -> bool:
+    """Whether a scope range is small enough for merged local-scope batching."""
+    start_line = max(0, scope_range.start.row)
+    end_line = min(len(lines) - 1, scope_range.end.row)
+    if end_line < start_line:
+        return False
+
+    line_count = end_line - start_line + 1
+    if line_count > max_lines:
+        return False
+
+    char_count = sum(len(lines[i]) + 1 for i in range(start_line, end_line + 1))
+    return char_count <= max_chars
+
+
+def _collect_sorted_unique_identifiers(
+    scope_infos: dict[str, ScopeInfo],
+    scope_ids: list[str],
+) -> list[IdentifierInfo]:
+    """Collect identifiers from scope ids, deduplicated and source-order sorted."""
+    deduped: list[IdentifierInfo] = []
+    seen: set[tuple[str, int, int, str]] = set()
+
+    for scope_id in scope_ids:
+        scope_info = scope_infos.get(scope_id)
+        if scope_info is None:
+            continue
+        for identifier in scope_info.identifiers:
+            key = (identifier.name, identifier.line, identifier.column, identifier.scope_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(identifier)
+
+    deduped.sort(key=lambda identifier: (identifier.line, identifier.column, identifier.name))
+    return deduped
 
 
 def _split_program_scope_with_constraints(
