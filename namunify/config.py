@@ -35,6 +35,7 @@ class Config(BaseSettings):
     llm_base_url: Optional[str] = Field(default=None, description="Base URL for API (for custom endpoints)")
     llm_max_tokens: int = Field(default=4096, description="Maximum tokens for LLM response")
     llm_temperature: float = Field(default=0.3, description="Temperature for LLM generation")
+    llm_concurrency: int = Field(default=1, ge=1, description="Number of concurrent LLM rename requests")
 
     # Processing Settings
     max_context_size: int = Field(default=32000, description="Maximum context size for LLM (in characters)")

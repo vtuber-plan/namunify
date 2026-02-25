@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,20 @@ debug_log_file = None
 state_manager = StateManager()
 _PREPROCESS_CACHE_KEY = "__preprocess_cache__"
 _PREPROCESS_CACHE_SUBDIR = "preprocess"
+
+
+@dataclass
+class ScopeRenameRequest:
+    """Prepared rename request payload for one scope on a fixed source snapshot."""
+    scope_id: str
+    scope_type: str
+    range_start_row: int
+    range_end_row: int
+    symbols: list[str]
+    symbol_lines: dict[str, int]
+    context: str
+    snippets: dict[str, str]
+    global_context_meta: dict[str, object]
 
 
 def setup_debug_logger(log_path: Optional[Path] = None) -> logging.Logger:
@@ -423,6 +438,202 @@ def _get_binding_reference_lines(
     return None
 
 
+def _build_scope_rename_request(
+    scope_info,
+    scope_symbols: list[str],
+    current_source: str,
+    current_parse_result,
+    max_context_lines: int,
+    max_context_size: int,
+) -> ScopeRenameRequest:
+    """Build prompt context/snippets for one scope rename request."""
+    symbol_set = set(scope_symbols)
+    symbol_lines = {id.name: id.line + 1 for id in scope_info.identifiers if id.name in symbol_set}
+
+    current_lines = current_source.split("\n")
+    scope_line_count = scope_info.range.end.row - scope_info.range.start.row + 1
+    global_context_meta: dict[str, object] = {}
+
+    if scope_info.scope_type == "program" and len(scope_symbols) == 1:
+        # Global symbol: use focused declaration context + reference snippets.
+        symbol = scope_symbols[0]
+        declaration_line = symbol_lines.get(symbol, 1) - 1
+        ast_reference_lines = _get_binding_reference_lines(
+            current_parse_result,
+            symbol,
+            declaration_line,
+        )
+        context = _build_global_symbol_context(
+            current_lines,
+            symbol,
+            declaration_line,
+            max_context_lines=max_context_lines,
+            reference_lines=ast_reference_lines,
+        )
+        reference_preview_lines = ast_reference_lines or []
+        global_context_meta = {
+            "global_declaration_text": _clip_line_content(
+                current_lines[declaration_line],
+                300,
+            ) if 0 <= declaration_line < len(current_lines) else "",
+            "global_reference_texts": [
+                f"{line_no + 1}: {_clip_line_content(current_lines[line_no], 300)}"
+                for line_no in reference_preview_lines[:5]
+                if 0 <= declaration_line < len(current_lines)
+                and 0 <= line_no < len(current_lines)
+            ],
+        }
+    elif scope_line_count <= max_context_lines:
+        # Small scope: include entire scope with padding
+        context_start = max(0, scope_info.range.start.row - 10)
+        context_end = min(len(current_lines), scope_info.range.end.row + 10)
+        context_lines = []
+        for i in range(context_start, context_end):
+            context_lines.append(_format_numbered_line(i, current_lines[i]))
+        context = "\n".join(context_lines)
+    else:
+        # Large scope: only include context around each symbol
+        context_line_set = set()
+        for id_info in scope_info.identifiers:
+            if id_info.name not in symbol_set:
+                continue
+            id_line = id_info.line
+            # Add lines around each symbol
+            for i in range(max(0, id_line - 20), min(len(current_lines), id_line + 20)):
+                context_line_set.add(i)
+
+        # If still too many lines, limit further
+        if len(context_line_set) > max_context_lines:
+            # Prioritize lines closest to symbols
+            sorted_lines = sorted(context_line_set)
+            context_line_set = set(sorted_lines[:max_context_lines])
+
+        context_lines = []
+        for i in sorted(context_line_set):
+            context_lines.append(_format_numbered_line(i, current_lines[i]))
+        context = "\n".join(context_lines)
+
+    snippets = {}
+    for id_info in scope_info.identifiers:
+        if id_info.name not in symbol_set:
+            continue
+        id_line = id_info.line
+        if scope_info.scope_type == "program":
+            ast_reference_lines = _get_binding_reference_lines(
+                current_parse_result,
+                id_info.name,
+                id_line,
+            )
+            snippets[id_info.name] = _build_global_symbol_snippet(
+                current_lines,
+                id_info.name,
+                id_line,
+                reference_lines=ast_reference_lines,
+            )
+        else:
+            snippet_start = max(0, id_line - 3)
+            snippet_end = min(len(current_lines), id_line + 4)
+            snippet_lines = []
+            for i in range(snippet_start, snippet_end):
+                marker = " >>> " if i == id_line else "     "
+                snippet_lines.append(f"{marker}{_format_numbered_line(i, current_lines[i])}")
+            snippets[id_info.name] = "\n".join(snippet_lines)
+
+    max_context_chars = max(2048, max_context_size)
+    max_snippet_chars = max(1024, min(12000, max_context_chars // 2))
+    context, snippets = _apply_prompt_size_limits(
+        context=context,
+        snippets=snippets,
+        max_context_chars=max_context_chars,
+        max_snippet_chars=max_snippet_chars,
+    )
+
+    return ScopeRenameRequest(
+        scope_id=scope_info.scope_id,
+        scope_type=scope_info.scope_type,
+        range_start_row=scope_info.range.start.row,
+        range_end_row=scope_info.range.end.row,
+        symbols=scope_symbols,
+        symbol_lines=symbol_lines,
+        context=context,
+        snippets=snippets,
+        global_context_meta=global_context_meta,
+    )
+
+
+async def _request_scope_renames(
+    llm_client,
+    request: ScopeRenameRequest,
+    max_context_size: int,
+) -> dict[str, str]:
+    """Call LLM for one scope, retrying once with compact prompt on input-size errors."""
+    max_context_chars = max(2048, max_context_size)
+    max_snippet_chars = max(1024, min(12000, max_context_chars // 2))
+
+    try:
+        return await llm_client.rename_symbols(
+            context=request.context,
+            symbols=request.symbols,
+            snippets=request.snippets,
+            symbol_lines=request.symbol_lines,
+        )
+    except Exception as e:
+        if not _is_input_too_long_error(e):
+            raise
+
+        debug_log("warning", "LLM input too long, retrying with compact context", {
+            "error": str(e),
+            "scope_id": request.scope_id,
+            "symbols": request.symbols,
+            "context_length": len(request.context),
+        })
+
+        compact_context, compact_snippets = _apply_prompt_size_limits(
+            context=request.context,
+            snippets=request.snippets,
+            max_context_chars=min(8000, max_context_chars),
+            max_snippet_chars=min(2000, max_snippet_chars),
+        )
+        return await llm_client.rename_symbols(
+            context=compact_context,
+            symbols=request.symbols,
+            snippets=compact_snippets,
+            symbol_lines=request.symbol_lines,
+        )
+
+
+def _filter_llm_renames_for_request(
+    request: ScopeRenameRequest,
+    renames: dict[str, str],
+) -> tuple[dict[str, str], set[str]]:
+    """Keep only renames that match requested symbols for one scope."""
+    filtered_renames: dict[str, str] = {}
+    resolved_symbols: set[str] = set()
+
+    for symbol in request.symbols:
+        if symbol in renames:
+            filtered_renames[symbol] = renames[symbol]
+            resolved_symbols.add(symbol)
+            continue
+
+        if request.symbol_lines and symbol in request.symbol_lines:
+            line_key = f"{symbol}:{request.symbol_lines[symbol]}"
+            if line_key in renames:
+                filtered_renames[line_key] = renames[line_key]
+                resolved_symbols.add(symbol)
+                continue
+
+        # Fallback for single-symbol mode: accept a single returned rename value
+        # even if the key is not exact (e.g., "symbolName").
+        if len(request.symbols) == 1 and len(renames) == 1:
+            only_value = next(iter(renames.values()))
+            if isinstance(only_value, str) and only_value.strip():
+                filtered_renames[symbol] = only_value.strip()
+                resolved_symbols.add(symbol)
+
+    return filtered_renames, resolved_symbols
+
+
 async def process_file(
     file_path: Path,
     config: Config,
@@ -776,6 +987,7 @@ async def process_file(
                 "llm_provider": str(config.llm_provider),
                 "llm_model": config.llm_model,
                 "llm_base_url": config.llm_base_url,
+                "llm_concurrency": config.llm_concurrency,
                 "max_symbols_per_batch": config.max_symbols_per_batch,
                 "program_batching_enabled": config.program_batching_enabled,
                 "program_max_symbols_per_batch": config.program_max_symbols_per_batch,
@@ -803,6 +1015,7 @@ async def process_file(
             "provider": str(config.llm_provider),
             "model": config.llm_model,
             "base_url": config.llm_base_url,
+            "llm_concurrency": config.llm_concurrency,
             "max_tokens": config.llm_max_tokens,
             "temperature": config.llm_temperature,
         })
@@ -846,280 +1059,193 @@ async def process_file(
                 local_scope_merge_function_max_lines=config.local_scope_merge_function_max_lines,
             )
 
-            # Find the first scope with remaining symbols to rename
-            found_scope = False
+            # Select up to N scopes from this AST snapshot for concurrent LLM requests.
+            max_parallel_requests = max(1, config.llm_concurrency)
+            selected_symbol_names: set[str] = set()
+            batch_requests: list[ScopeRenameRequest] = []
+
             for scope_info in current_scope_infos:
-                scope_symbols = [id.name for id in scope_info.identifiers if id.name in remaining_symbol_names]
+                scope_symbols: list[str] = []
+                for id_info in scope_info.identifiers:
+                    symbol_name = id_info.name
+                    if symbol_name not in remaining_symbol_names:
+                        continue
+                    if symbol_name in selected_symbol_names:
+                        continue
+                    scope_symbols.append(symbol_name)
+                    selected_symbol_names.add(symbol_name)
+
                 if not scope_symbols:
                     continue
 
-                found_scope = True
-                symbols = scope_symbols
-                symbol_lines = {id.name: id.line + 1 for id in scope_info.identifiers if id.name in remaining_symbol_names}
-
-                # Build context from current source
-                # Limit context size to avoid sending huge context to LLM
-                MAX_CONTEXT_LINES = config.max_context_lines  # Max lines to send
-
-                current_lines = current_source.split("\n")
-                scope_line_count = scope_info.range.end.row - scope_info.range.start.row + 1
-                global_context_meta: dict[str, object] = {}
-
-                if scope_info.scope_type == "program" and len(symbols) == 1:
-                    # Global symbol: use focused declaration context + reference snippets.
-                    symbol = symbols[0]
-                    declaration_line = symbol_lines.get(symbol, 1) - 1
-                    ast_reference_lines = _get_binding_reference_lines(
-                        current_parse_result,
-                        symbol,
-                        declaration_line,
-                    )
-                    context = _build_global_symbol_context(
-                        current_lines,
-                        symbol,
-                        declaration_line,
-                        max_context_lines=MAX_CONTEXT_LINES,
-                        reference_lines=ast_reference_lines,
-                    )
-                    reference_preview_lines = ast_reference_lines or []
-                    global_context_meta = {
-                        "global_declaration_text": _clip_line_content(
-                            current_lines[declaration_line],
-                            300,
-                        ) if 0 <= declaration_line < len(current_lines) else "",
-                        "global_reference_texts": [
-                            f"{line_no + 1}: {_clip_line_content(current_lines[line_no], 300)}"
-                            for line_no in reference_preview_lines[:5]
-                            if 0 <= declaration_line < len(current_lines)
-                            and 0 <= line_no < len(current_lines)
-                        ],
-                    }
-                elif scope_line_count <= MAX_CONTEXT_LINES:
-                    # Small scope: include entire scope with padding
-                    context_start = max(0, scope_info.range.start.row - 10)
-                    context_end = min(len(current_lines), scope_info.range.end.row + 10)
-                    context_lines = []
-                    for i in range(context_start, context_end):
-                        context_lines.append(_format_numbered_line(i, current_lines[i]))
-                    context = "\n".join(context_lines)
-                else:
-                    # Large scope: only include context around each symbol
-                    context_line_set = set()
-                    for id_info in scope_info.identifiers:
-                        if id_info.name not in remaining_symbol_names:
-                            continue
-                        id_line = id_info.line
-                        # Add lines around each symbol
-                        for i in range(max(0, id_line - 20), min(len(current_lines), id_line + 20)):
-                            context_line_set.add(i)
-
-                    # If still too many lines, limit further
-                    if len(context_line_set) > MAX_CONTEXT_LINES:
-                        # Prioritize lines closest to symbols
-                        sorted_lines = sorted(context_line_set)
-                        context_line_set = set(sorted_lines[:MAX_CONTEXT_LINES])
-
-                    context_lines = []
-                    for i in sorted(context_line_set):
-                        context_lines.append(_format_numbered_line(i, current_lines[i]))
-                    context = "\n".join(context_lines)
-
-                # Build snippets dict
-                snippets = {}
-                for id_info in scope_info.identifiers:
-                    if id_info.name not in remaining_symbol_names:
-                        continue
-                    id_line = id_info.line
-                    if scope_info.scope_type == "program":
-                        ast_reference_lines = _get_binding_reference_lines(
-                            current_parse_result,
-                            id_info.name,
-                            id_line,
-                        )
-                        snippets[id_info.name] = _build_global_symbol_snippet(
-                            current_lines,
-                            id_info.name,
-                            id_line,
-                            reference_lines=ast_reference_lines,
-                        )
-                    else:
-                        snippet_start = max(0, id_line - 3)
-                        snippet_end = min(len(current_lines), id_line + 4)
-                        snippet_lines = []
-                        for i in range(snippet_start, snippet_end):
-                            marker = " >>> " if i == id_line else "     "
-                            snippet_lines.append(f"{marker}{_format_numbered_line(i, current_lines[i])}")
-                        snippets[id_info.name] = "\n".join(snippet_lines)
-
-                # Enforce max prompt size to avoid provider input-length errors.
-                # `max_context_size` is char-based budget for context text.
-                max_context_chars = max(2048, config.max_context_size)
-                max_snippet_chars = max(1024, min(12000, max_context_chars // 2))
-                context, snippets = _apply_prompt_size_limits(
-                    context=context,
-                    snippets=snippets,
-                    max_context_chars=max_context_chars,
-                    max_snippet_chars=max_snippet_chars,
+                request = _build_scope_rename_request(
+                    scope_info=scope_info,
+                    scope_symbols=scope_symbols,
+                    current_source=current_source,
+                    current_parse_result=current_parse_result,
+                    max_context_lines=config.max_context_lines,
+                    max_context_size=config.max_context_size,
                 )
+                batch_requests.append(request)
 
+                if len(batch_requests) >= max_parallel_requests:
+                    break
+
+            if not batch_requests:
+                # No more scopes with remaining symbols.
+                break
+
+            for request in batch_requests:
                 debug_log("info", f"\n{'='*60}")
-                debug_log("info", f"Processing scope: {scope_info.scope_id}", {
-                    "scope_type": scope_info.scope_type,
-                    "range": f"lines {scope_info.range.start.row}-{scope_info.range.end.row}",
-                    "symbols_to_rename": symbols,
-                    "symbol_lines": symbol_lines,
-                    "context_length": len(context),
-                    "context_preview": context[:500] + "..." if len(context) > 500 else context,
+                debug_log("info", f"Processing scope: {request.scope_id}", {
+                    "scope_type": request.scope_type,
+                    "range": f"lines {request.range_start_row}-{request.range_end_row}",
+                    "symbols_to_rename": request.symbols,
+                    "symbol_lines": request.symbol_lines,
+                    "context_length": len(request.context),
+                    "context_preview": (
+                        request.context[:500] + "..."
+                        if len(request.context) > 500
+                        else request.context
+                    ),
                     "already_renamed_count": len(all_renames),
                     "remaining_count": len(remaining_symbol_names),
-                    **global_context_meta,
+                    "llm_concurrency": config.llm_concurrency,
+                    **request.global_context_meta,
                 })
 
+            async def _run_scope_request(request: ScopeRenameRequest):
                 try:
-                    # Call LLM to rename
-                    try:
-                        renames = await llm_client.rename_symbols(
-                            context=context,
-                            symbols=symbols,
-                            snippets=snippets,
-                            symbol_lines=symbol_lines,
-                        )
-                    except Exception as e:
-                        if not _is_input_too_long_error(e):
-                            raise
+                    renames = await _request_scope_renames(
+                        llm_client=llm_client,
+                        request=request,
+                        max_context_size=config.max_context_size,
+                    )
+                    return request, renames, None
+                except Exception as exc:
+                    return request, None, exc
 
-                        debug_log("warning", "LLM input too long, retrying with compact context", {
-                            "error": str(e),
-                            "symbols": symbols,
-                            "context_length": len(context),
-                        })
-                        compact_context, compact_snippets = _apply_prompt_size_limits(
-                            context=context,
-                            snippets=snippets,
-                            max_context_chars=min(8000, max_context_chars),
-                            max_snippet_chars=min(2000, max_snippet_chars),
-                        )
-                        renames = await llm_client.rename_symbols(
-                            context=compact_context,
-                            symbols=symbols,
-                            snippets=compact_snippets,
-                            symbol_lines=symbol_lines,
-                        )
+            request_results = await asyncio.gather(
+                *[_run_scope_request(request) for request in batch_requests]
+            )
 
+            batch_filtered_renames: dict[str, str] = {}
+            batch_resolved_symbols: set[str] = set()
+            skipped_symbols_count = 0
+            retryable_failures = 0
+
+            for request, renames, request_error in request_results:
+                if request_error is None and renames is not None:
                     debug_log("info", f"LLM response", {
+                        "scope_id": request.scope_id,
                         "renames": renames,
-                        "symbols_requested": symbols,
+                        "symbols_requested": request.symbols,
                         "symbols_returned": list(renames.keys()),
                     })
 
-                    # Keep only renames that match current requested symbols.
-                    # This prevents progress inflation when LLM returns unrelated keys.
-                    filtered_renames: dict[str, str] = {}
-                    resolved_symbols: set[str] = set()
-                    for symbol in symbols:
-                        if symbol in renames:
-                            filtered_renames[symbol] = renames[symbol]
-                            resolved_symbols.add(symbol)
-                            continue
-
-                        if symbol_lines and symbol in symbol_lines:
-                            line_key = f"{symbol}:{symbol_lines[symbol]}"
-                            if line_key in renames:
-                                filtered_renames[line_key] = renames[line_key]
-                                resolved_symbols.add(symbol)
-                                continue
-
-                        # Fallback for single-symbol mode: accept a single returned rename value
-                        # even if the key is not exact (e.g., "symbolName").
-                        if len(symbols) == 1 and len(renames) == 1:
-                            only_value = next(iter(renames.values()))
-                            if isinstance(only_value, str) and only_value.strip():
-                                filtered_renames[symbol] = only_value.strip()
-                                resolved_symbols.add(symbol)
-
+                    filtered_renames, resolved_symbols = _filter_llm_renames_for_request(request, renames)
                     if not filtered_renames:
                         debug_log("warning", "No usable renames returned for requested symbols", {
-                            "symbols_requested": symbols,
+                            "scope_id": request.scope_id,
+                            "symbols_requested": request.symbols,
                             "symbols_returned": list(renames.keys()),
                         })
                         # Avoid infinite loop on unusable model output.
-                        for symbol in symbols:
+                        for symbol in request.symbols:
                             remaining_symbol_names.discard(symbol)
-                        pbar.update(len(symbols))
-                        pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
+                        skipped_symbols_count += len(request.symbols)
                         continue
 
-                    filtered_renames = _normalize_rename_keys_for_unique_bindings(
-                        filtered_renames,
-                        current_binding_name_counts,
-                    )
+                    batch_filtered_renames.update(filtered_renames)
+                    batch_resolved_symbols.update(resolved_symbols)
+                    continue
 
-                    # Apply validated renames
-                    generator.apply_renames(filtered_renames)
-                    stats["symbols_renamed"] += len(resolved_symbols)
-                    all_renames.update(filtered_renames)
+                error = request_error if request_error is not None else Exception("unknown LLM request error")
+                import traceback
 
-                    # Remove renamed symbols from remaining
-                    for resolved_symbol in resolved_symbols:
-                        remaining_symbol_names.discard(resolved_symbol)
+                error_trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                debug_log("error", f"Error processing scope", {
+                    "scope_id": request.scope_id,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                    "traceback": error_trace,
+                    "symbols": request.symbols,
+                })
 
-                    # Save checkpoint state
+                if _is_fatal_llm_response_error(error):
+                    console.print(f"[red]Error: {error}[/red]")
+                    raise error
+
+                if _is_retryable_llm_error(error):
+                    retryable_failures += 1
+                    continue
+
+                console.print(f"[red]Error: {error}[/red]")
+                # Skip these symbols and continue for non-retryable scope-level failures.
+                for symbol in request.symbols:
+                    remaining_symbol_names.discard(symbol)
+                skipped_symbols_count += len(request.symbols)
+
+            if batch_filtered_renames:
+                batch_filtered_renames = _normalize_rename_keys_for_unique_bindings(
+                    batch_filtered_renames,
+                    current_binding_name_counts,
+                )
+
+                # Apply all validated renames from this snapshot atomically,
+                # then next loop re-parses from the updated code.
+                generator.apply_renames(batch_filtered_renames)
+                stats["symbols_renamed"] += len(batch_resolved_symbols)
+                all_renames.update(batch_filtered_renames)
+
+                for resolved_symbol in batch_resolved_symbols:
+                    remaining_symbol_names.discard(resolved_symbol)
+
+                if state_manager._current_state is not None:
                     state_manager._current_state.all_renames = all_renames.copy()
                     state_manager._current_state.processed_scopes = len(scope_infos) - len(remaining_symbol_names)
                     state_manager.save_state(state_manager._current_state)
 
-                    debug_log("info", f"Applied {len(filtered_renames)} renames, checkpoint saved", {
-                        "total_renamed": stats["symbols_renamed"],
-                        "resolved_symbols_count": len(resolved_symbols),
+                debug_log("info", f"Applied {len(batch_filtered_renames)} renames, checkpoint saved", {
+                    "total_renamed": stats["symbols_renamed"],
+                    "resolved_symbols_count": len(batch_resolved_symbols),
+                    "remaining_count": len(remaining_symbol_names),
+                })
+
+                pbar.update(len(batch_resolved_symbols))
+
+            if skipped_symbols_count > 0:
+                pbar.update(skipped_symbols_count)
+
+            pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
+
+            if retryable_failures > 0:
+                if batch_filtered_renames or skipped_symbols_count > 0:
+                    debug_log("warning", "Some retryable LLM errors occurred; unresolved symbols will retry next round", {
+                        "retryable_failures": retryable_failures,
                         "remaining_count": len(remaining_symbol_names),
                     })
-
-                    # Update progress bar
-                    pbar.update(len(resolved_symbols))
-                    pbar.set_postfix_str(f"remaining={len(remaining_symbol_names)}")
                     consecutive_retryable_errors = 0
-
-                except Exception as e:
-                    import traceback
-                    error_trace = traceback.format_exc()
-                    debug_log("error", f"Error processing scope", {
-                        "error_type": type(e).__name__,
-                        "error_message": str(e),
-                        "traceback": error_trace,
-                        "symbols": symbols,
+                else:
+                    consecutive_retryable_errors += 1
+                    retry_delay = min(60, 2 ** min(consecutive_retryable_errors, 6))
+                    debug_log("warning", "Retryable LLM error, will retry same symbols", {
+                        "retryable_failures": retryable_failures,
+                        "retry_delay_seconds": retry_delay,
+                        "consecutive_retryable_errors": consecutive_retryable_errors,
                     })
-                    if _is_fatal_llm_response_error(e):
-                        console.print(f"[red]Error: {e}[/red]")
-                        raise
-                    if _is_retryable_llm_error(e):
-                        consecutive_retryable_errors += 1
-                        retry_delay = min(60, 2 ** min(consecutive_retryable_errors, 6))
-                        debug_log("warning", "Retryable LLM error, will retry same symbols", {
-                            "error": str(e),
-                            "symbols": symbols,
-                            "retry_delay_seconds": retry_delay,
-                            "consecutive_retryable_errors": consecutive_retryable_errors,
-                        })
-                        console.print(
-                            f"[yellow]Retryable LLM error, retrying in {retry_delay}s: {e}[/yellow]"
+                    console.print(
+                        f"[yellow]Retryable LLM error, retrying in {retry_delay}s "
+                        f"({retryable_failures} failed requests this round)[/yellow]"
+                    )
+                    if consecutive_retryable_errors >= 12:
+                        raise RuntimeError(
+                            "LLM rate limit/connection errors persisted for 12 retries; "
+                            "please lower request rate or retry later."
                         )
-                        if consecutive_retryable_errors >= 12:
-                            raise RuntimeError(
-                                "LLM rate limit/connection errors persisted for 12 retries; "
-                                "please lower request rate or retry later."
-                            ) from e
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        console.print(f"[red]Error: {e}[/red]")
-                        # Skip these symbols and continue for non-retryable scope-level failures.
-                        for s in symbols:
-                            remaining_symbol_names.discard(s)
-
-                break  # Exit scope loop after processing first scope with remaining symbols
-
-            if not found_scope:
-                # No more scopes with remaining symbols
-                break
+                    await asyncio.sleep(retry_delay)
+            else:
+                consecutive_retryable_errors = 0
 
         # Close progress bar
         pbar.close()
@@ -1228,6 +1354,7 @@ def main():
 @click.option("--model", help="LLM model name")
 @click.option("--api-key", help="API key (or set NAMUNIFY_LLM_API_KEY env)")
 @click.option("--base-url", help="Custom API base URL")
+@click.option("--llm-concurrency", default=1, type=click.IntRange(1, None), help="Concurrent LLM requests per round")
 @click.option("--max-symbols", default=50, help="Max symbols per LLM call")
 @click.option("--program-max-symbols", default=10, help="Max top-level symbols per LLM call")
 @click.option(
@@ -1279,6 +1406,7 @@ def deobfuscate(
     model: Optional[str],
     api_key: Optional[str],
     base_url: Optional[str],
+    llm_concurrency: int,
     max_symbols: int,
     program_max_symbols: int,
     program_var_max_chars: int,
@@ -1317,6 +1445,7 @@ def deobfuscate(
             "output_path": str(output_path) if output_path else None,
             "provider": provider,
             "model": model,
+            "llm_concurrency": llm_concurrency,
             "max_symbols": max_symbols,
             "program_max_symbols": program_max_symbols,
             "program_var_max_chars": program_var_max_chars,
@@ -1337,6 +1466,7 @@ def deobfuscate(
     # Build config kwargs, only include non-None CLI args to let .env values be used
     config_kwargs = {
         "llm_provider": LLMProvider(provider),
+        "llm_concurrency": llm_concurrency,
         "max_symbols_per_batch": max_symbols,
         "program_batching_enabled": not no_program_batch,
         "program_max_symbols_per_batch": program_max_symbols,
@@ -1368,6 +1498,7 @@ def deobfuscate(
         "llm_provider": str(config.llm_provider),
         "llm_model": config.llm_model,
         "llm_base_url": config.llm_base_url,
+        "llm_concurrency": config.llm_concurrency,
         "max_symbols_per_batch": config.max_symbols_per_batch,
         "program_batching_enabled": config.program_batching_enabled,
         "program_max_symbols_per_batch": config.program_max_symbols_per_batch,
