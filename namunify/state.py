@@ -172,9 +172,10 @@ class StateManager:
 
     def get_progress_summary(self, state: ProcessingState) -> str:
         """Get a human-readable progress summary."""
-        percent = (state.processed_scopes / state.total_scopes * 100) if state.total_scopes > 0 else 0
+        safe_processed_scopes = max(0, min(state.processed_scopes, state.total_scopes))
+        percent = (safe_processed_scopes / state.total_scopes * 100) if state.total_scopes > 0 else 0
         return (
-            f"Progress: {state.processed_scopes}/{state.total_scopes} scopes ({percent:.1f}%), "
+            f"Progress: {safe_processed_scopes}/{state.total_scopes} scopes ({percent:.1f}%), "
             f"{len(state.all_renames)} symbols renamed"
         )
 

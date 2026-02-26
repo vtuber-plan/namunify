@@ -35,6 +35,55 @@ debug_log_file = None
 state_manager = StateManager()
 _PREPROCESS_CACHE_KEY = "__preprocess_cache__"
 _PREPROCESS_CACHE_SUBDIR = "preprocess"
+_JS_RESERVED_WORDS = {
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+    "implements",
+    "interface",
+    "let",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "static",
+}
+_JS_DISALLOWED_RENAME_WORDS = set(_JS_RESERVED_WORDS) | {"constructor"}
 
 
 @dataclass
@@ -235,6 +284,136 @@ def _count_binding_names(parse_result) -> dict[str, int]:
     for binding in parse_result.all_bindings:
         counts[binding.name] = counts.get(binding.name, 0) + 1
     return counts
+
+
+def _is_valid_js_identifier_name(name: str) -> bool:
+    """Whether a candidate rename is a safe JavaScript identifier name."""
+    if not isinstance(name, str):
+        return False
+    candidate = name.strip()
+    if not candidate:
+        return False
+    if not re.match(r"^[A-Za-z_$][A-Za-z0-9_$]*$", candidate):
+        return False
+    if candidate in _JS_DISALLOWED_RENAME_WORDS:
+        return False
+    return True
+
+
+def _filter_invalid_rename_values(
+    renames: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Split renames into valid and invalid-by-value mappings."""
+    valid: dict[str, str] = {}
+    invalid: dict[str, str] = {}
+    for old_name, new_name in renames.items():
+        normalized_new_name = new_name.strip() if isinstance(new_name, str) else new_name
+        if isinstance(normalized_new_name, str) and _is_valid_js_identifier_name(normalized_new_name):
+            valid[old_name] = normalized_new_name
+        else:
+            invalid[old_name] = str(new_name)
+    return valid, invalid
+
+
+def _resolve_symbol_names_from_rename_keys(rename_keys: set[str]) -> set[str]:
+    """Resolve base symbol names from plain and line-specific rename keys."""
+    resolved: set[str] = set()
+    for key in rename_keys:
+        parsed = _parse_line_specific_key(key)
+        if parsed is None:
+            resolved.add(key)
+        else:
+            resolved.add(parsed[0])
+    return resolved
+
+
+def _build_binding_scope_index(parse_result) -> tuple[dict[tuple[str, int], str], dict[str, set[str]]]:
+    """Build lookup indices for binding scope collision checks."""
+    binding_scope_by_name_line: dict[tuple[str, int], str] = {}
+    scope_binding_names: dict[str, set[str]] = {}
+
+    for scope_id, scope in parse_result.scopes.items():
+        scope_binding_names[scope_id] = {binding.name for binding in scope.bindings}
+
+    for binding in parse_result.all_bindings:
+        binding_scope_by_name_line[(binding.name, binding.range.start.row)] = binding.scope_id or ""
+
+    return binding_scope_by_name_line, scope_binding_names
+
+
+def _symbol_and_line_from_rename_key(
+    key: str,
+    request: ScopeRenameRequest,
+) -> tuple[str, Optional[int]]:
+    """Resolve base symbol and 1-based declaration line from rename key."""
+    parsed = _parse_line_specific_key(key)
+    if parsed is not None:
+        return parsed[0], parsed[1]
+    return key, request.symbol_lines.get(key)
+
+
+def _resolve_scope_conflicting_renames(
+    request: ScopeRenameRequest,
+    renames: dict[str, str],
+    binding_scope_by_name_line: dict[tuple[str, int], str],
+    scope_binding_names: dict[str, set[str]],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Resolve rename collisions per scope by suffixing later candidates."""
+    if not renames:
+        return {}, {}, {}
+
+    outgoing_names_by_scope: dict[str, set[str]] = {}
+    for key in renames.keys():
+        symbol, line_1_based = _symbol_and_line_from_rename_key(key, request)
+        if line_1_based is None:
+            continue
+        scope_id = binding_scope_by_name_line.get((symbol, line_1_based - 1))
+        if not scope_id:
+            continue
+        outgoing_names_by_scope.setdefault(scope_id, set()).add(symbol)
+
+    accepted: dict[str, str] = {}
+    adjusted: dict[str, str] = {}
+    unresolved: dict[str, str] = {}
+    used_target_names_by_scope: dict[str, set[str]] = {}
+
+    for key, new_name in renames.items():
+        symbol, line_1_based = _symbol_and_line_from_rename_key(key, request)
+        if line_1_based is None:
+            accepted[key] = new_name
+            continue
+
+        scope_id = binding_scope_by_name_line.get((symbol, line_1_based - 1))
+        if not scope_id:
+            accepted[key] = new_name
+            continue
+
+        used_target_names = used_target_names_by_scope.setdefault(scope_id, set())
+        existing_names = scope_binding_names.get(scope_id, set())
+        outgoing_names = outgoing_names_by_scope.get(scope_id, set())
+        blocked_names = (existing_names - outgoing_names) | used_target_names
+
+        resolved_name = new_name
+        if resolved_name in blocked_names:
+            suffix = 1
+            while True:
+                candidate = f"{new_name}_{suffix}"
+                if candidate not in blocked_names and _is_valid_js_identifier_name(candidate):
+                    resolved_name = candidate
+                    adjusted[key] = resolved_name
+                    break
+                suffix += 1
+                if suffix > 10000:
+                    unresolved[key] = new_name
+                    break
+
+        if key in unresolved:
+            continue
+
+        accepted[key] = resolved_name
+        used_target_names.add(resolved_name)
+
+    return accepted, adjusted, unresolved
 
 
 def _compute_sha256(text: str) -> str:
@@ -678,9 +857,11 @@ async def process_file(
             processing_state = state_manager.load_state(file_path)
             if processing_state and ask_resume(processing_state, state_manager):
                 resumed_from_checkpoint = True
-                start_scope_idx = processing_state.processed_scopes
+                # Scope order/shape can drift after each regeneration; resume by renames only.
+                start_scope_idx = 0
                 debug_log("info", "Resume checkpoint accepted", {
-                    "start_scope_idx": start_scope_idx,
+                    "saved_processed_scopes": processing_state.processed_scopes,
+                    "effective_start_scope_idx": start_scope_idx,
                     "processed_scopes": processing_state.processed_scopes,
                     "total_scopes": processing_state.total_scopes,
                 })
@@ -972,13 +1153,20 @@ async def process_file(
                 processing_state.all_renames,
                 initial_binding_name_counts,
             )
-            generator.apply_renames(normalized_saved_renames)
-            processing_state.all_renames = normalized_saved_renames
-            stats["symbols_renamed"] = len(normalized_saved_renames)
+            valid_saved_renames, invalid_saved_renames = _filter_invalid_rename_values(normalized_saved_renames)
+            if invalid_saved_renames:
+                debug_log("warning", "Dropped invalid saved renames from checkpoint", {
+                    "invalid_count": len(invalid_saved_renames),
+                    "invalid_examples": dict(list(invalid_saved_renames.items())[:20]),
+                })
+            generator.apply_renames(valid_saved_renames)
+            processing_state.all_renames = valid_saved_renames
+            stats["symbols_renamed"] = len(valid_saved_renames)
             console.print(f"[green]Resuming from scope {start_scope_idx + 1}[/green]")
             debug_log("info", "Resuming from checkpoint", {
                 "start_scope_idx": start_scope_idx,
-                "already_renamed_count": len(normalized_saved_renames),
+                "already_renamed_count": len(valid_saved_renames),
+                "dropped_invalid_saved_renames": len(invalid_saved_renames),
             })
 
         # Create or get processing state
@@ -1026,7 +1214,7 @@ async def process_file(
 
         # Track remaining symbols to rename (excluding already renamed)
         remaining_symbol_names = set()
-        for scope_info in scope_infos[start_scope_idx:]:
+        for scope_info in scope_infos:
             for id_info in scope_info.identifiers:
                 if id_info.name not in all_renames:
                     remaining_symbol_names.add(id_info.name)
@@ -1046,6 +1234,7 @@ async def process_file(
             current_source = generator.get_current_source()
             current_parse_result = parse_javascript(current_source)
             current_binding_name_counts = _count_binding_names(current_parse_result)
+            binding_scope_by_name_line, scope_binding_names = _build_binding_scope_index(current_parse_result)
             current_scope_infos = analyze_identifiers(
                 current_parse_result,
                 max_context_lines=config.context_padding,
@@ -1152,7 +1341,7 @@ async def process_file(
                         "symbols_returned": list(renames.keys()),
                     })
 
-                    filtered_renames, resolved_symbols = _filter_llm_renames_for_request(request, renames)
+                    filtered_renames, _ = _filter_llm_renames_for_request(request, renames)
                     if not filtered_renames:
                         debug_log("warning", "No usable renames returned for requested symbols", {
                             "scope_id": request.scope_id,
@@ -1165,8 +1354,38 @@ async def process_file(
                         skipped_symbols_count += len(request.symbols)
                         continue
 
+                    filtered_renames, adjusted_conflicting_renames, unresolved_conflicting_renames = _resolve_scope_conflicting_renames(
+                        request=request,
+                        renames=filtered_renames,
+                        binding_scope_by_name_line=binding_scope_by_name_line,
+                        scope_binding_names=scope_binding_names,
+                    )
+                    if adjusted_conflicting_renames:
+                        debug_log("info", "Adjusted scope-conflicting rename values with suffixes", {
+                            "scope_id": request.scope_id,
+                            "adjusted_count": len(adjusted_conflicting_renames),
+                            "adjusted_examples": dict(list(adjusted_conflicting_renames.items())[:20]),
+                        })
+
+                    if unresolved_conflicting_renames:
+                        unresolved_symbols = _resolve_symbol_names_from_rename_keys(
+                            set(unresolved_conflicting_renames.keys())
+                        )
+                        debug_log("warning", "Dropped unresolved scope-conflicting rename values", {
+                            "scope_id": request.scope_id,
+                            "unresolved_count": len(unresolved_conflicting_renames),
+                            "unresolved_examples": dict(list(unresolved_conflicting_renames.items())[:20]),
+                            "unresolved_symbols_count": len(unresolved_symbols),
+                        })
+                        for symbol in unresolved_symbols:
+                            remaining_symbol_names.discard(symbol)
+                        skipped_symbols_count += len(unresolved_symbols)
+
+                    if not filtered_renames:
+                        continue
+
                     batch_filtered_renames.update(filtered_renames)
-                    batch_resolved_symbols.update(resolved_symbols)
+                    batch_resolved_symbols.update(_resolve_symbol_names_from_rename_keys(set(filtered_renames.keys())))
                     continue
 
                 error = request_error if request_error is not None else Exception("unknown LLM request error")
@@ -1200,28 +1419,55 @@ async def process_file(
                     batch_filtered_renames,
                     current_binding_name_counts,
                 )
+                batch_filtered_renames, invalid_batch_renames = _filter_invalid_rename_values(batch_filtered_renames)
+                if invalid_batch_renames:
+                    invalid_symbols = _resolve_symbol_names_from_rename_keys(set(invalid_batch_renames.keys()))
+                    debug_log("warning", "Dropped invalid rename values from LLM output", {
+                        "invalid_count": len(invalid_batch_renames),
+                        "invalid_examples": dict(list(invalid_batch_renames.items())[:20]),
+                        "invalid_symbols_count": len(invalid_symbols),
+                    })
+                    # Treat invalid rename candidates as skipped to avoid retry loops
+                    # repeatedly producing unparseable identifier names.
+                    for symbol in invalid_symbols:
+                        remaining_symbol_names.discard(symbol)
+                    skipped_symbols_count += len(invalid_symbols)
 
-                # Apply all validated renames from this snapshot atomically,
-                # then next loop re-parses from the updated code.
-                generator.apply_renames(batch_filtered_renames)
-                stats["symbols_renamed"] += len(batch_resolved_symbols)
-                all_renames.update(batch_filtered_renames)
+                if batch_filtered_renames:
+                    # Recompute resolved symbols from valid rename keys only.
+                    batch_resolved_symbols = _resolve_symbol_names_from_rename_keys(
+                        set(batch_filtered_renames.keys())
+                    )
 
-                for resolved_symbol in batch_resolved_symbols:
-                    remaining_symbol_names.discard(resolved_symbol)
+                    # Apply all validated renames from this snapshot atomically,
+                    # then next loop re-parses from the updated code.
+                    generator.apply_renames(batch_filtered_renames)
+                    stats["symbols_renamed"] += len(batch_resolved_symbols)
+                    all_renames.update(batch_filtered_renames)
 
-                if state_manager._current_state is not None:
-                    state_manager._current_state.all_renames = all_renames.copy()
-                    state_manager._current_state.processed_scopes = len(scope_infos) - len(remaining_symbol_names)
-                    state_manager.save_state(state_manager._current_state)
+                    for resolved_symbol in batch_resolved_symbols:
+                        remaining_symbol_names.discard(resolved_symbol)
 
-                debug_log("info", f"Applied {len(batch_filtered_renames)} renames, checkpoint saved", {
-                    "total_renamed": stats["symbols_renamed"],
-                    "resolved_symbols_count": len(batch_resolved_symbols),
-                    "remaining_count": len(remaining_symbol_names),
-                })
+                    if state_manager._current_state is not None:
+                        state_manager._current_state.all_renames = all_renames.copy()
+                        progress_ratio = (
+                            stats["symbols_renamed"] / total_symbols
+                            if total_symbols > 0 else 1.0
+                        )
+                        estimated_processed_scopes = int(len(scope_infos) * progress_ratio)
+                        state_manager._current_state.processed_scopes = min(
+                            len(scope_infos),
+                            max(0, estimated_processed_scopes),
+                        )
+                        state_manager.save_state(state_manager._current_state)
 
-                pbar.update(len(batch_resolved_symbols))
+                    debug_log("info", f"Applied {len(batch_filtered_renames)} renames, checkpoint saved", {
+                        "total_renamed": stats["symbols_renamed"],
+                        "resolved_symbols_count": len(batch_resolved_symbols),
+                        "remaining_count": len(remaining_symbol_names),
+                    })
+
+                    pbar.update(len(batch_resolved_symbols))
 
             if skipped_symbols_count > 0:
                 pbar.update(skipped_symbols_count)
