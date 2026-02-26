@@ -988,6 +988,7 @@ async def process_file(
                 "llm_model": config.llm_model,
                 "llm_base_url": config.llm_base_url,
                 "llm_concurrency": config.llm_concurrency,
+                "llm_round_size": config.llm_round_size,
                 "max_symbols_per_batch": config.max_symbols_per_batch,
                 "program_batching_enabled": config.program_batching_enabled,
                 "program_max_symbols_per_batch": config.program_max_symbols_per_batch,
@@ -1016,6 +1017,7 @@ async def process_file(
             "model": config.llm_model,
             "base_url": config.llm_base_url,
             "llm_concurrency": config.llm_concurrency,
+            "llm_round_size": config.llm_round_size,
             "max_tokens": config.llm_max_tokens,
             "temperature": config.llm_temperature,
         })
@@ -1059,8 +1061,11 @@ async def process_file(
                 local_scope_merge_function_max_lines=config.local_scope_merge_function_max_lines,
             )
 
-            # Select up to N scopes from this AST snapshot for concurrent LLM requests.
+            # Select up to N scopes from this AST snapshot.
+            # We can process more scopes than active concurrency to amortize parse/analyze cost.
             max_parallel_requests = max(1, config.llm_concurrency)
+            max_requests_per_round = config.llm_round_size if config.llm_round_size > 0 else max_parallel_requests
+            max_requests_per_round = max(max_parallel_requests, max_requests_per_round)
             selected_symbol_names: set[str] = set()
             batch_requests: list[ScopeRenameRequest] = []
 
@@ -1088,7 +1093,7 @@ async def process_file(
                 )
                 batch_requests.append(request)
 
-                if len(batch_requests) >= max_parallel_requests:
+                if len(batch_requests) >= max_requests_per_round:
                     break
 
             if not batch_requests:
@@ -1111,19 +1116,23 @@ async def process_file(
                     "already_renamed_count": len(all_renames),
                     "remaining_count": len(remaining_symbol_names),
                     "llm_concurrency": config.llm_concurrency,
+                    "llm_round_size": config.llm_round_size,
                     **request.global_context_meta,
                 })
 
+            llm_request_semaphore = asyncio.Semaphore(max_parallel_requests)
+
             async def _run_scope_request(request: ScopeRenameRequest):
-                try:
-                    renames = await _request_scope_renames(
-                        llm_client=llm_client,
-                        request=request,
-                        max_context_size=config.max_context_size,
-                    )
-                    return request, renames, None
-                except Exception as exc:
-                    return request, None, exc
+                async with llm_request_semaphore:
+                    try:
+                        renames = await _request_scope_renames(
+                            llm_client=llm_client,
+                            request=request,
+                            max_context_size=config.max_context_size,
+                        )
+                        return request, renames, None
+                    except Exception as exc:
+                        return request, None, exc
 
             request_results = await asyncio.gather(
                 *[_run_scope_request(request) for request in batch_requests]
@@ -1355,6 +1364,12 @@ def main():
 @click.option("--api-key", help="API key (or set NAMUNIFY_LLM_API_KEY env)")
 @click.option("--base-url", help="Custom API base URL")
 @click.option("--llm-concurrency", default=1, type=click.IntRange(1, None), help="Concurrent LLM requests per round")
+@click.option(
+    "--llm-round-size",
+    default=0,
+    type=click.IntRange(0, None),
+    help="Scope requests per parse round (0 = same as llm-concurrency)",
+)
 @click.option("--max-symbols", default=50, help="Max symbols per LLM call")
 @click.option("--program-max-symbols", default=10, help="Max top-level symbols per LLM call")
 @click.option(
@@ -1407,6 +1422,7 @@ def deobfuscate(
     api_key: Optional[str],
     base_url: Optional[str],
     llm_concurrency: int,
+    llm_round_size: int,
     max_symbols: int,
     program_max_symbols: int,
     program_var_max_chars: int,
@@ -1446,6 +1462,7 @@ def deobfuscate(
             "provider": provider,
             "model": model,
             "llm_concurrency": llm_concurrency,
+            "llm_round_size": llm_round_size,
             "max_symbols": max_symbols,
             "program_max_symbols": program_max_symbols,
             "program_var_max_chars": program_var_max_chars,
@@ -1467,6 +1484,7 @@ def deobfuscate(
     config_kwargs = {
         "llm_provider": LLMProvider(provider),
         "llm_concurrency": llm_concurrency,
+        "llm_round_size": llm_round_size,
         "max_symbols_per_batch": max_symbols,
         "program_batching_enabled": not no_program_batch,
         "program_max_symbols_per_batch": program_max_symbols,
@@ -1499,6 +1517,7 @@ def deobfuscate(
         "llm_model": config.llm_model,
         "llm_base_url": config.llm_base_url,
         "llm_concurrency": config.llm_concurrency,
+        "llm_round_size": config.llm_round_size,
         "max_symbols_per_batch": config.max_symbols_per_batch,
         "program_batching_enabled": config.program_batching_enabled,
         "program_max_symbols_per_batch": config.program_max_symbols_per_batch,

@@ -36,6 +36,11 @@ class Config(BaseSettings):
     llm_max_tokens: int = Field(default=4096, description="Maximum tokens for LLM response")
     llm_temperature: float = Field(default=0.3, description="Temperature for LLM generation")
     llm_concurrency: int = Field(default=1, ge=1, description="Number of concurrent LLM rename requests")
+    llm_round_size: int = Field(
+        default=0,
+        ge=0,
+        description="Scope requests to process per parse round (0 means auto = llm_concurrency)",
+    )
 
     # Processing Settings
     max_context_size: int = Field(default=32000, description="Maximum context size for LLM (in characters)")
