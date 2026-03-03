@@ -341,6 +341,14 @@ def _build_binding_scope_index(parse_result) -> tuple[dict[tuple[str, int], str]
     return binding_scope_by_name_line, scope_binding_names
 
 
+def _build_binding_lines_index(parse_result) -> dict[str, list[int]]:
+    """Build lookup of declaration lines (0-based) for each binding name."""
+    binding_lines_by_name: dict[str, list[int]] = {}
+    for binding in parse_result.all_bindings:
+        binding_lines_by_name.setdefault(binding.name, []).append(binding.range.start.row)
+    return binding_lines_by_name
+
+
 def _symbol_and_line_from_rename_key(
     key: str,
     request: ScopeRenameRequest,
@@ -384,6 +392,81 @@ def _resolve_scope_conflicting_renames(
             continue
 
         scope_id = binding_scope_by_name_line.get((symbol, line_1_based - 1))
+        if not scope_id:
+            accepted[key] = new_name
+            continue
+
+        used_target_names = used_target_names_by_scope.setdefault(scope_id, set())
+        existing_names = scope_binding_names.get(scope_id, set())
+        outgoing_names = outgoing_names_by_scope.get(scope_id, set())
+        blocked_names = (existing_names - outgoing_names) | used_target_names
+
+        resolved_name = new_name
+        if resolved_name in blocked_names:
+            suffix = 1
+            while True:
+                candidate = f"{new_name}_{suffix}"
+                if candidate not in blocked_names and _is_valid_js_identifier_name(candidate):
+                    resolved_name = candidate
+                    adjusted[key] = resolved_name
+                    break
+                suffix += 1
+                if suffix > 10000:
+                    unresolved[key] = new_name
+                    break
+
+        if key in unresolved:
+            continue
+
+        accepted[key] = resolved_name
+        used_target_names.add(resolved_name)
+
+    return accepted, adjusted, unresolved
+
+
+def _resolve_global_conflicting_renames(
+    renames: dict[str, str],
+    binding_scope_by_name_line: dict[tuple[str, int], str],
+    scope_binding_names: dict[str, set[str]],
+    binding_lines_by_name: dict[str, list[int]],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Resolve rename collisions across the whole batch/checkpoint payload.
+
+    This catches collisions that can slip through per-request checks when multiple
+    requests from the same AST snapshot are applied together.
+    """
+    if not renames:
+        return {}, {}, {}
+
+    key_meta: dict[str, tuple[str, Optional[int], Optional[str]]] = {}
+    outgoing_names_by_scope: dict[str, set[str]] = {}
+
+    for key in renames.keys():
+        parsed = _parse_line_specific_key(key)
+        if parsed is not None:
+            symbol, line_1_based = parsed
+        else:
+            symbol = key
+            candidate_lines = binding_lines_by_name.get(symbol, [])
+            line_1_based = candidate_lines[0] + 1 if len(candidate_lines) == 1 else None
+
+        scope_id: Optional[str] = None
+        if line_1_based is not None:
+            resolved_scope_id = binding_scope_by_name_line.get((symbol, line_1_based - 1))
+            if resolved_scope_id:
+                scope_id = resolved_scope_id
+
+        key_meta[key] = (symbol, line_1_based, scope_id)
+        if scope_id:
+            outgoing_names_by_scope.setdefault(scope_id, set()).add(symbol)
+
+    accepted: dict[str, str] = {}
+    adjusted: dict[str, str] = {}
+    unresolved: dict[str, str] = {}
+    used_target_names_by_scope: dict[str, set[str]] = {}
+
+    for key, new_name in renames.items():
+        symbol, _line_1_based, scope_id = key_meta.get(key, (key, None, None))
         if not scope_id:
             accepted[key] = new_name
             continue
@@ -1159,6 +1242,26 @@ async def process_file(
                     "invalid_count": len(invalid_saved_renames),
                     "invalid_examples": dict(list(invalid_saved_renames.items())[:20]),
                 })
+            initial_binding_scope_by_name_line, initial_scope_binding_names = _build_binding_scope_index(parse_result)
+            initial_binding_lines_by_name = _build_binding_lines_index(parse_result)
+            valid_saved_renames, adjusted_saved_conflicts, unresolved_saved_conflicts = _resolve_global_conflicting_renames(
+                renames=valid_saved_renames,
+                binding_scope_by_name_line=initial_binding_scope_by_name_line,
+                scope_binding_names=initial_scope_binding_names,
+                binding_lines_by_name=initial_binding_lines_by_name,
+            )
+            if adjusted_saved_conflicts:
+                debug_log("warning", "Adjusted checkpoint rename collisions before replay", {
+                    "adjusted_count": len(adjusted_saved_conflicts),
+                    "adjusted_examples": dict(list(adjusted_saved_conflicts.items())[:20]),
+                })
+            if unresolved_saved_conflicts:
+                unresolved_saved_symbols = _resolve_symbol_names_from_rename_keys(set(unresolved_saved_conflicts.keys()))
+                debug_log("warning", "Dropped unresolved checkpoint rename collisions", {
+                    "unresolved_count": len(unresolved_saved_conflicts),
+                    "unresolved_examples": dict(list(unresolved_saved_conflicts.items())[:20]),
+                    "unresolved_symbols_count": len(unresolved_saved_symbols),
+                })
             generator.apply_renames(valid_saved_renames)
             processing_state.all_renames = valid_saved_renames
             stats["symbols_renamed"] = len(valid_saved_renames)
@@ -1167,6 +1270,8 @@ async def process_file(
                 "start_scope_idx": start_scope_idx,
                 "already_renamed_count": len(valid_saved_renames),
                 "dropped_invalid_saved_renames": len(invalid_saved_renames),
+                "adjusted_checkpoint_collisions": len(adjusted_saved_conflicts),
+                "dropped_checkpoint_collision_renames": len(unresolved_saved_conflicts),
             })
 
         # Create or get processing state
@@ -1235,6 +1340,7 @@ async def process_file(
             current_parse_result = parse_javascript(current_source)
             current_binding_name_counts = _count_binding_names(current_parse_result)
             binding_scope_by_name_line, scope_binding_names = _build_binding_scope_index(current_parse_result)
+            binding_lines_by_name = _build_binding_lines_index(current_parse_result)
             current_scope_infos = analyze_identifiers(
                 current_parse_result,
                 max_context_lines=config.context_padding,
@@ -1438,6 +1544,38 @@ async def process_file(
                     batch_resolved_symbols = _resolve_symbol_names_from_rename_keys(
                         set(batch_filtered_renames.keys())
                     )
+
+                    (
+                        batch_filtered_renames,
+                        adjusted_batch_collisions,
+                        unresolved_batch_collisions,
+                    ) = _resolve_global_conflicting_renames(
+                        renames=batch_filtered_renames,
+                        binding_scope_by_name_line=binding_scope_by_name_line,
+                        scope_binding_names=scope_binding_names,
+                        binding_lines_by_name=binding_lines_by_name,
+                    )
+                    if adjusted_batch_collisions:
+                        debug_log("info", "Adjusted cross-request scope-conflicting rename values with suffixes", {
+                            "adjusted_count": len(adjusted_batch_collisions),
+                            "adjusted_examples": dict(list(adjusted_batch_collisions.items())[:20]),
+                        })
+
+                    if unresolved_batch_collisions:
+                        unresolved_batch_symbols = _resolve_symbol_names_from_rename_keys(
+                            set(unresolved_batch_collisions.keys())
+                        )
+                        debug_log("warning", "Dropped unresolved cross-request scope-conflicting rename values", {
+                            "unresolved_count": len(unresolved_batch_collisions),
+                            "unresolved_examples": dict(list(unresolved_batch_collisions.items())[:20]),
+                            "unresolved_symbols_count": len(unresolved_batch_symbols),
+                        })
+                        for symbol in unresolved_batch_symbols:
+                            remaining_symbol_names.discard(symbol)
+                        skipped_symbols_count += len(unresolved_batch_symbols)
+
+                    if not batch_filtered_renames:
+                        continue
 
                     # Apply all validated renames from this snapshot atomically,
                     # then next loop re-parses from the updated code.

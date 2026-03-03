@@ -2,6 +2,8 @@
 
 from namunify.cli import (
     _apply_prompt_size_limits,
+    _build_binding_lines_index,
+    _build_binding_scope_index,
     _build_global_symbol_context,
     _build_global_symbol_snippet,
     _count_binding_names,
@@ -10,6 +12,7 @@ from namunify.cli import (
     _is_retryable_llm_error,
     _normalize_rename_keys_for_unique_bindings,
     _parse_line_specific_key,
+    _resolve_global_conflicting_renames,
     _truncate_text_middle,
 )
 from namunify.core.parser import parse_javascript
@@ -135,3 +138,59 @@ function f(a) { return a; }
 
         assert normalized["a:2"] == "globalValue"
         assert normalized["a:3"] == "paramValue"
+
+    def test_resolve_global_conflicts_suffixes_same_scope_target(self):
+        """Batch-level conflict resolver should suffix duplicate targets in one scope."""
+        code = """
+function f() {
+  let a__u1 = 1;
+  let b__u2 = 2;
+  return a__u1 + b__u2;
+}
+"""
+        parse_result = parse_javascript(code)
+        binding_scope_by_name_line, scope_binding_names = _build_binding_scope_index(parse_result)
+        binding_lines_by_name = _build_binding_lines_index(parse_result)
+
+        accepted, adjusted, unresolved = _resolve_global_conflicting_renames(
+            renames={
+                "a__u1": "value",
+                "b__u2": "value",
+            },
+            binding_scope_by_name_line=binding_scope_by_name_line,
+            scope_binding_names=scope_binding_names,
+            binding_lines_by_name=binding_lines_by_name,
+        )
+
+        assert unresolved == {}
+        assert accepted["a__u1"] == "value"
+        assert accepted["b__u2"] == "value_1"
+        assert adjusted["b__u2"] == "value_1"
+
+    def test_resolve_global_conflicts_allows_swap_when_both_outgoing(self):
+        """Resolver should allow renaming to an outgoing name in the same scope."""
+        code = """
+function f() {
+  let a__u1 = 1;
+  let b__u2 = 2;
+  return a__u1 + b__u2;
+}
+"""
+        parse_result = parse_javascript(code)
+        binding_scope_by_name_line, scope_binding_names = _build_binding_scope_index(parse_result)
+        binding_lines_by_name = _build_binding_lines_index(parse_result)
+
+        accepted, adjusted, unresolved = _resolve_global_conflicting_renames(
+            renames={
+                "a__u1": "b__u2",
+                "b__u2": "value",
+            },
+            binding_scope_by_name_line=binding_scope_by_name_line,
+            scope_binding_names=scope_binding_names,
+            binding_lines_by_name=binding_lines_by_name,
+        )
+
+        assert unresolved == {}
+        assert adjusted == {}
+        assert accepted["a__u1"] == "b__u2"
+        assert accepted["b__u2"] == "value"
